@@ -101,6 +101,7 @@
 #
 # =============================================================================
 
+import codecs
 import serial
 import serial.tools.list_ports
 import time
@@ -282,11 +283,18 @@ def parse_baudrates(raw: str) -> List[int]:
 
 def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
     """引数から読み取りモードを決定する。"""
-    if args.delimiter:
-        delimiter = bytes.fromhex(args.delimiter.replace(' ', ''))
+    if args.delimiter is not None:
+        delimiter_hex = args.delimiter.replace(' ', '')
+        if not delimiter_hex:
+            raise ValueError('empty delimiter')
+        delimiter = bytes.fromhex(delimiter_hex)
         return ReadMode(mode='delimiter', delimiter=delimiter)
-    if args.chunk:
+
+    if args.chunk is not None:
+        if args.chunk <= 0:
+            raise ValueError('invalid chunk size')
         return ReadMode(mode='chunk', chunk_size=args.chunk)
+
     return ReadMode(mode='newline')
 
 
@@ -298,6 +306,13 @@ def parse_encodings(raw: Optional[str]) -> List[str]:
     encodings = [encoding.strip() for encoding in raw.split(',') if encoding.strip()]
     if not encodings:
         raise ValueError('empty encodings')
+
+    for encoding in encodings:
+        try:
+            codecs.lookup(encoding)
+        except LookupError as exc:
+            raise ValueError(f'invalid encoding: {encoding}') from exc
+
     return encodings
 
 
@@ -797,7 +812,7 @@ def main() -> None:
     try:
         read_mode = resolve_read_mode(args)
     except ValueError:
-        print("Error: --delimiter は 16 進数で指定してください (例: 0D0A)")
+        print("Error: --delimiter は空でない 16 進数、--chunk は 1 以上の整数を指定してください")
         sys.exit(1)
 
     # --- シリアル設定の組み立て ---
