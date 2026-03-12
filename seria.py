@@ -176,6 +176,36 @@ class ReadMode:
     mode: str = 'newline'
     delimiter: bytes = b''
     chunk_size: int = 0
+    selected_by_user: bool = False
+
+
+@dataclass
+class LineBufferedReader:
+    """改行終端モード用の内部バッファ。"""
+    pending: bytearray = field(default_factory=bytearray)
+
+    def read_line(self, ser: serial.Serial) -> bytes:
+        while True:
+            for idx, value in enumerate(self.pending):
+                if value == 0x0A:  # LF
+                    return self._consume(idx + 1)
+                if value == 0x0D:  # CR
+                    if idx + 1 < len(self.pending) and self.pending[idx + 1] == 0x0A:
+                        return self._consume(idx + 2)
+                    return self._consume(idx + 1)
+
+            read_size = max(getattr(ser, 'in_waiting', 0), 64)
+            chunk = ser.read(read_size)
+            if not chunk:
+                if self.pending:
+                    return self._consume(len(self.pending))
+                return b''
+            self.pending.extend(chunk)
+
+    def _consume(self, size: int) -> bytes:
+        data = bytes(self.pending[:size])
+        del self.pending[:size]
+        return data
 
 
 # ==============================
@@ -283,9 +313,14 @@ def decode_data(
     省略時は DEFAULT_ENCODINGS を使う。
     strip_newline=True の場合、デコード後文字列の末尾 CR/LF を除去する。
     """
+    if b'\x00' in data:
+        return 'binary', ''
+
     for enc in (encodings or DEFAULT_ENCODINGS):
         try:
             decoded = data.decode(enc)
+            if not looks_like_text(decoded):
+                continue
             if strip_newline:
                 decoded = decoded.rstrip('\r\n')
             return enc, decoded
@@ -296,6 +331,26 @@ def decode_data(
             # 不正なエンコーディング名はこの候補のみスキップする。
             continue
     return 'binary', ''
+
+
+def looks_like_text(decoded: str) -> bool:
+    """バイナリ混入を避けるための簡易テキスト判定。"""
+    if not decoded:
+        return True
+
+    allowed_controls = {'\n', '\r', '\t'}
+    control_count = 0
+    printable_count = 0
+    for ch in decoded:
+        if ch.isprintable() or ch in allowed_controls:
+            printable_count += 1
+        elif ord(ch) < 32 or ord(ch) == 127:
+            control_count += 1
+
+    total = len(decoded)
+    printable_ratio = printable_count / total
+    control_ratio = control_count / total
+    return printable_ratio >= 0.7 and control_ratio <= 0.1
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
@@ -328,14 +383,13 @@ def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
         if not delimiter:
             raise ValueError('empty delimiter')
 
-        return ReadMode(mode='delimiter', delimiter=delimiter)
+        return ReadMode(mode='delimiter', delimiter=delimiter, selected_by_user=True)
 
     if args.chunk is not None:
         if args.chunk <= 0:
             raise ValueError('invalid chunk size')
-        return ReadMode(mode='chunk', chunk_size=args.chunk)
-
-    return ReadMode(mode='newline')
+        return ReadMode(mode='chunk', chunk_size=args.chunk, selected_by_user=True)
+    return ReadMode(mode='newline', selected_by_user=args.newline)
 
 
 def parse_encodings(raw: Optional[str]) -> List[str]:
@@ -460,7 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- 出力形式 ---
     parser.add_argument(
         '--json', action='store_true',
-        help="結果を JSON 形式で標準出力にも出す"
+        help="結果を JSON 形式で標準出力に出す（stdout は JSON のみ）"
     )
     parser.add_argument(
         '--json-file', metavar='PATH',
@@ -468,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--quiet', action='store_true',
-        help="進捗ログ（チャンク受信通知・起動メッセージ）を抑制する"
+        help="標準出力/標準エラーの通常表示を抑制する（エラーのみ出力）"
     )
     parser.add_argument(
         '--no-attr', action='store_true',
@@ -486,25 +540,25 @@ def print_startup_summary(
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
 ) -> None:
     """監視開始前の設定と検出ポート情報を表示する。"""
-    print(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}")
-    print(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}")
+    print(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}", file=sys.stderr)
+    print(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}", file=sys.stderr)
     print(
         f"読み取りモード   : {read_mode.mode}"
         + (f" / デリミタ: {read_mode.delimiter.hex(' ').upper()}" if read_mode.mode == 'delimiter' else '')
         + (f" / {read_mode.chunk_size} bytes" if read_mode.mode == 'chunk' else '')
-    )
-    print(f"エンコーディング : {', '.join(encodings)}")
+    , file=sys.stderr)
+    print(f"エンコーディング : {', '.join(encodings)}", file=sys.stderr)
 
     if no_attr:
         return
 
-    print("\n--- 検出ポート属性 ---")
+    print("\n--- 検出ポート属性 ---", file=sys.stderr)
     for port in ports:
         info = get_port_info(port, port_info_map=port_info_map)
-        print(f"  {port}")
-        print_port_info(info)
+        print(f"  {port}", file=sys.stderr)
+        print_port_info(info, stream=sys.stderr)
         if not info:
-            print("    （属性情報なし）")
+            print("    （属性情報なし）", file=sys.stderr)
 
 
 def chunk_stats(data: bytes, read_mode: ReadMode,
@@ -564,7 +618,7 @@ class PortResult:
     serial_params: Dict = field(default_factory=dict)
 
 
-def read_one_chunk(ser: serial.Serial, read_mode: ReadMode) -> bytes:
+def read_one_chunk(ser: serial.Serial, read_mode: ReadMode, line_reader: Optional[LineBufferedReader] = None) -> bytes:
     """
     読み取りモードに応じて 1 チャンク分のデータを読んで返す。
       newline  : \r\n / \r / \n を終端として読む（自前実装）
@@ -572,27 +626,8 @@ def read_one_chunk(ser: serial.Serial, read_mode: ReadMode) -> bytes:
       chunk    : read(n)    ― 固定長バイト数を読む
     """
     if read_mode.mode == 'newline':
-        pending = getattr(ser, '_seria_pending', b'')
-        buf = bytearray(pending)
-        setattr(ser, '_seria_pending', b'')
-
-        while True:
-            one = ser.read(1)
-            if not one:
-                return bytes(buf)
-
-            buf += one
-
-            if one == b'\n':
-                return bytes(buf)
-
-            if one == b'\r':
-                next_byte = ser.read(1)
-                if next_byte == b'\n':
-                    buf += next_byte
-                elif next_byte:
-                    setattr(ser, '_seria_pending', next_byte)
-                return bytes(buf)
+        reader = line_reader or LineBufferedReader()
+        return reader.read_line(ser)
     elif read_mode.mode == 'delimiter':
         return ser.read_until(expected=read_mode.delimiter)
     else:
@@ -643,15 +678,19 @@ def monitor_port(
         return
 
     collected: List[Dict] = []
+    line_reader = LineBufferedReader()
     deadline = time.monotonic() + wait_sec
     try:
         while time.monotonic() < deadline:
             try:
-                chunk = read_one_chunk(ser, read_mode)
+                chunk = read_one_chunk(ser, read_mode, line_reader=line_reader)
             except ReferenceError as e:
                 # pyserial の内部オブジェクトが GC された場合など、
                 # まれに weakref 由来の ReferenceError が伝播することがある。
                 result.error = f"ReferenceError while reading serial port: {e}"
+                break
+            except (serial.SerialException, OSError) as e:
+                result.error = f"I/O error while reading serial port: {e}"
                 break
             if chunk:
                 frame_complete, reason = classify_chunk(chunk, read_mode)
@@ -662,13 +701,13 @@ def monitor_port(
                 })
                 if not quiet:
                     with lock:
-                        print(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}")
+                        print(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", file=sys.stderr)
                 if len(collected) >= num_chunks:
                     break
     finally:
         try:
             ser.close()
-        except ReferenceError:
+        except (ReferenceError, serial.SerialException, OSError):
             # クローズ時に weakref 由来エラーが発生しても、取得済みデータは保持する。
             if not result.error:
                 result.error = "ReferenceError while closing serial port"
@@ -738,7 +777,7 @@ def monitor_all(
     combos = [(p, b) for p in ports for b in baudrates]
     if not quiet:
         print(f"\n{len(combos)} 組合せ（{len(ports)} ポート × {len(baudrates)} ボーレート）を監視開始"
-              f"（ポート間は並列、同一ポート内は直列 / 最大 {wait_sec} 秒）…")
+              f"（ポート間は並列、同一ポート内は直列 / 最大 {wait_sec} 秒）…", file=sys.stderr)
 
     for port in ports:
         t = threading.Thread(
@@ -759,7 +798,7 @@ def monitor_all(
 # ==============================
 # 表示
 # ==============================
-def print_port_info(info: Dict) -> None:
+def print_port_info(info: Dict, stream=sys.stderr) -> None:
     """ポート属性情報を表示する"""
     if not info:
         return
@@ -774,7 +813,7 @@ def print_port_info(info: Dict) -> None:
     for label, key in labels:
         val = info.get(key)
         if val:
-            print(f"    {label:16}: {val}")
+            print(f"    {label:16}: {val}", file=stream)
 
 
 def print_results(
@@ -792,66 +831,66 @@ def print_results(
     silent = [r for r in results if not r.chunks and not r.error]
     errors = [r for r in results if r.error]
 
-    print("\n" + "=" * 56)
-    print("  監視結果サマリー")
-    print("=" * 56)
+    print("\n" + "=" * 56, file=sys.stderr)
+    print("  監視結果サマリー", file=sys.stderr)
+    print("=" * 56, file=sys.stderr)
 
     for r in active:
-        print(f"\n  ポート    : {r.port}  @  {r.baudrate} bps")
+        print(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", file=sys.stderr)
         params = r.serial_params
         print(f"  シリアル  : {params['bytesize']}{params['parity']}{params['stopbits']}"
               f"  RTS/CTS={'ON' if params['rtscts'] else 'OFF'}"
               f"  XON/XOFF={'ON' if params['xonxoff'] else 'OFF'}"
-              f"  DSR/DTR={'ON' if params.get('dsrdtr') else 'OFF'}")
+              f"  DSR/DTR={'ON' if params.get('dsrdtr') else 'OFF'}", file=sys.stderr)
         if not no_attr:
-            print_port_info(r.port_info)
-        print(f"  受信チャンク数: {len(r.chunks)}")
-        print(f"  {'-'*50}")
+            print_port_info(r.port_info, stream=sys.stderr)
+        print(f"  受信チャンク数: {len(r.chunks)}", file=sys.stderr)
+        print(f"  {'-'*50}", file=sys.stderr)
 
         per_chunk_stats = [chunk_stats(chunk['data'], read_mode, encodings) for chunk in r.chunks]
         for i, (chunk_item, stats) in enumerate(zip(r.chunks, per_chunk_stats), start=1):
             data = chunk_item['data']
-            print(f"  --- チャンク {i} ---")
-            print(f"    repr         : {repr(data)}")
-            print(f"    hex          : {data.hex(' ')}")
-            print(f"    終端         : {stats['terminator']}")
+            print(f"  --- チャンク {i} ---", file=sys.stderr)
+            print(f"    repr         : {repr(data)}", file=sys.stderr)
+            print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
+            print(f"    終端         : {stats['terminator']}", file=sys.stderr)
             print(f"    完全フレーム : {'Yes' if chunk_item['frame_complete'] else 'No'}"
-                  f"  ({chunk_item['reason']})")
+                  f"  ({chunk_item['reason']})", file=sys.stderr)
             print(f"    受信バイト数 : {stats['raw_bytes']} bytes"
-                  f"  （データ {stats['payload_bytes']} + 終端 {stats['delim_bytes']}）")
+                  f"  （データ {stats['payload_bytes']} + 終端 {stats['delim_bytes']}）", file=sys.stderr)
             if stats['encoding'] == 'binary':
-                print(f"    デコード     : 失敗（バイナリデータ）")
+                print(f"    デコード     : 失敗（バイナリデータ）", file=sys.stderr)
             else:
-                print(f"    {stats['encoding'].upper():9}    : {stats['decoded']}")
+                print(f"    {stats['encoding'].upper():9}    : {stats['decoded']}", file=sys.stderr)
                 bpc_display = f"{stats['bytes_per_char']:.2f}" if stats['bytes_per_char'] is not None else "-"
                 print(f"    文字数       : {stats['char_count']} 文字"
-                      f"  （平均 {bpc_display} bytes/char）")
+                      f"  （平均 {bpc_display} bytes/char）", file=sys.stderr)
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
             payloads = [s['payload_bytes'] for s in per_chunk_stats]
             chars    = [s['char_count'] for s in per_chunk_stats if s['char_count'] is not None]
-            print(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---")
+            print(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", file=sys.stderr)
             print(f"    データバイト数: min={min(payloads)}  max={max(payloads)}"
-                  f"  avg={sum(payloads)/len(payloads):.1f}")
+                  f"  avg={sum(payloads)/len(payloads):.1f}", file=sys.stderr)
             if chars:
                 print(f"    文字数        : min={min(chars)}  max={max(chars)}"
-                      f"  avg={sum(chars)/len(chars):.1f}")
+                      f"  avg={sum(chars)/len(chars):.1f}", file=sys.stderr)
 
     if silent:
-        print("\n【データなし（タイムアウト）】")
+        print("\n【データなし（タイムアウト）】", file=sys.stderr)
         for r in silent:
-            print(f"  {r.port} @ {r.baudrate} bps", end='')
+            print(f"  {r.port} @ {r.baudrate} bps", end='', file=sys.stderr)
             if not no_attr and r.port_info.get('description'):
-                print(f"  ({r.port_info['description']})", end='')
-            print()
+                print(f"  ({r.port_info['description']})", end='', file=sys.stderr)
+            print(file=sys.stderr)
 
     if errors:
-        print("\n【オープンエラー】")
+        print("\n【オープンエラー】", file=sys.stderr)
         for r in errors:
-            print(f"  {r.port} @ {r.baudrate} bps : {r.error}")
+            print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
 
-    print("=" * 56)
+    print("=" * 56, file=sys.stderr)
 
 
 # ==============================
@@ -900,10 +939,11 @@ def build_json(
 
     # metadata: 調査パラメータをまとめて調査ログとして完結させる
     metadata = {
-        'timestamp'      : datetime.now().isoformat(),
+        'timestamp'      : datetime.now().astimezone().isoformat(),
         'read_mode'      : read_mode.mode,
         'delimiter_hex'  : read_mode.delimiter.hex(' ').upper() if read_mode.delimiter else None,
         'chunk_size'     : read_mode.chunk_size if read_mode.mode == 'chunk' else None,
+        'mode_selected_by_user': read_mode.selected_by_user,
         'encodings'      : encodings or DEFAULT_ENCODINGS,
     }
     if meta:
@@ -926,14 +966,14 @@ def main() -> None:
     try:
         baudrates = parse_baudrates(args.baudrate)
     except ValueError:
-        print("Error: --baudrate にはカンマ区切りの整数を指定してください (例: 9600,115200)")
+        print("Error: --baudrate にはカンマ区切りの整数を指定してください (例: 9600,115200)", file=sys.stderr)
         sys.exit(1)
 
     # --- 読み取りモードの決定 ---
     try:
         read_mode = resolve_read_mode(args)
     except ValueError:
-        print("Error: --delimiter は空でない 16 進数、--chunk は 1 以上の整数を指定してください")
+        print("Error: --delimiter は空でない 16 進数、--chunk は 1 以上の整数を指定してください", file=sys.stderr)
         sys.exit(1)
 
     if args.lines <= 0:
@@ -947,7 +987,7 @@ def main() -> None:
     try:
         encodings = parse_encodings(args.encodings)
     except ValueError:
-        print("Error: --encodings に有効なエンコーディングを指定してください")
+        print("Error: --encodings に有効なエンコーディングを指定してください", file=sys.stderr)
         sys.exit(1)
 
     # --- ポート解決 ---
@@ -964,8 +1004,8 @@ def main() -> None:
         ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports)
 
     if not ports:
-        print("Error: 利用可能なシリアルポートが見つかりませんでした。")
-        print("  接続を確認するか、ポートを引数で直接指定してください。")
+        print("Error: 利用可能なシリアルポートが見つかりませんでした。", file=sys.stderr)
+        print("  接続を確認するか、ポートを引数で直接指定してください。", file=sys.stderr)
         sys.exit(1)
 
     if not args.quiet:
@@ -987,7 +1027,8 @@ def main() -> None:
     )
 
     # --- 人間可読な表示 ---
-    print_results(results, read_mode, encodings=encodings, no_attr=args.no_attr)
+    if not args.quiet:
+        print_results(results, read_mode, encodings=encodings, no_attr=args.no_attr)
 
     # --- JSON 出力 ---
     if args.json or args.json_file:
@@ -1008,17 +1049,17 @@ def main() -> None:
         }
         payload = build_json(results, read_mode, encodings=encodings, meta=json_meta)
         if args.json:
-            print("\n--- JSON ---")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         if args.json_file:
             with open(args.json_file, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            print(f"\nJSON を保存しました: {args.json_file}")
+            if not args.quiet:
+                print(f"\nJSON を保存しました: {args.json_file}", file=sys.stderr)
 
     # アクティブなポートがなければ終了コード 1
     if not any(r.chunks for r in results):
         if not args.quiet:
-            print(f"\n{args.wait} 秒待機しましたが、どの組み合わせでもデータを受信できませんでした。")
+            print(f"\n{args.wait} 秒待機しましたが、どの組み合わせでもデータを受信できませんでした。", file=sys.stderr)
         sys.exit(1)
 
 

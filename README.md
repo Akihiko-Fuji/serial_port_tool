@@ -90,7 +90,7 @@ python seria.py COM3 COM5 /dev/rfcomm0
 次の3つから1つを選択します（既定は改行終端モード）。
 
 1. `--newline`
-   - `readline()` を使用
+   - 既定モード（明示指定も可能）
    - `\n` / `\r\n` / `\r` 終端の行単位読み取り
 2. `--delimiter HEX`
    - `read_until(expected=...)` を使用
@@ -128,11 +128,12 @@ python seria.py COM3 COM5 /dev/rfcomm0
 ## 5.6 出力
 
 - `--json`
-  - 結果 JSON を標準出力にも表示
+  - 結果 JSON を標準出力へ出力（stdout は JSON のみ）
+  - 人間向けサマリは標準エラーへ出力
 - `--json-file <path>`
   - 結果 JSON をファイル保存
 - `--quiet`
-  - 起動メッセージ / チャンク受信進捗の抑制
+  - 通常出力を抑制（エラーのみ標準エラーに表示）
 - `--no-attr`
   - ポート属性（VID:PID、メーカー等）の表示省略
 
