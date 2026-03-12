@@ -37,7 +37,7 @@ pip install pyserial
 このリポジトリを取得し、`seria.py` を実行します。
 
 ```bash
-git clone <このリポジトリのURL>
+git clone https://github.com/Akihiko-Fuji/serial_port_tool/
 cd serial_port_tool
 python seria.py --help
 ```
