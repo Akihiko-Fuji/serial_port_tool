@@ -194,7 +194,8 @@ class LineBufferedReader:
                         return self._consume(idx + 2)
                     return self._consume(idx + 1)
 
-            read_size = max(getattr(ser, 'in_waiting', 0), 64)
+            in_waiting = getattr(ser, 'in_waiting', 0)
+            read_size = in_waiting if in_waiting > 0 else 1
             chunk = ser.read(read_size)
             if not chunk:
                 if self.pending:
@@ -707,10 +708,10 @@ def monitor_port(
     finally:
         try:
             ser.close()
-        except (ReferenceError, serial.SerialException, OSError):
+        except (ReferenceError, serial.SerialException, OSError) as e:
             # クローズ時に weakref 由来エラーが発生しても、取得済みデータは保持する。
             if not result.error:
-                result.error = "ReferenceError while closing serial port"
+                result.error = f"{type(e).__name__} while closing serial port: {e}"
 
     result.chunks = collected
 
@@ -886,7 +887,7 @@ def print_results(
             print(file=sys.stderr)
 
     if errors:
-        print("\n【オープンエラー】", file=sys.stderr)
+        print("\n【シリアルエラー（オープン/読み取り/クローズ）】", file=sys.stderr)
         for r in errors:
             print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
 
