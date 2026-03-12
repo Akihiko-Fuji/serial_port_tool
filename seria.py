@@ -176,6 +176,11 @@ class ReadMode:
 # ==============================
 # ポート探索
 # ==============================
+def list_port_info_map() -> Dict[str, serial.tools.list_ports_common.ListPortInfo]:
+    """OS が認識しているポート情報を device 名をキーにした辞書で返す。"""
+    return {info.device: info for info in serial.tools.list_ports.comports()}
+
+
 def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> List[str]:
     """
     実在するシリアルポートを返す（重複なし・ソート済み）。
@@ -193,7 +198,7 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
          comports() で存在確認だけ行い、一致したポートのみ追加する。
     """
     found = set()
-    known_ports = {info.device for info in serial.tools.list_ports.comports()}
+    known_ports = set(list_port_info_map().keys())
 
     for pattern in (patterns or []):
         expanded = glob.glob(pattern)
@@ -218,23 +223,24 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
     return sorted(found)
 
 
-def get_port_info(port: str) -> Dict:
+def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None) -> Dict:
     """
     pyserial の list_ports からポートの属性情報を取得して返す。
     VID:PID、メーカー、製品名、シリアル番号、説明など。
     """
-    for info in serial.tools.list_ports.comports():
-        if info.device == port:
-            vid = info.vid
-            pid = info.pid
-            return {
-                'vid_pid'     : f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else None,
-                'manufacturer': info.manufacturer,
-                'product'     : info.product,
-                'serial_number': info.serial_number,
-                'description' : info.description,
-                'interface'   : info.interface,
-            }
+    info_map = port_info_map or list_port_info_map()
+    info = info_map.get(port)
+    if info:
+        vid = info.vid
+        pid = info.pid
+        return {
+            'vid_pid'     : f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else None,
+            'manufacturer': info.manufacturer,
+            'product'     : info.product,
+            'serial_number': info.serial_number,
+            'description' : info.description,
+            'interface'   : info.interface,
+        }
     return {}
 
 
@@ -340,6 +346,7 @@ def print_startup_summary(
     read_mode: ReadMode,
     encodings: Sequence[str],
     no_attr: bool,
+    port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
 ) -> None:
     """監視開始前の設定と検出ポート情報を表示する。"""
     print(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}")
@@ -356,7 +363,7 @@ def print_startup_summary(
 
     print("\n--- 検出ポート属性 ---")
     for port in ports:
-        info = get_port_info(port)
+        info = get_port_info(port, port_info_map=port_info_map)
         print(f"  {port}")
         print_port_info(info)
         if not info:
@@ -505,6 +512,7 @@ def monitor_all(
     read_mode: ReadMode,
     serial_cfg: Dict,
     quiet: bool = False,
+    port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
 ) -> List[PortResult]:
     """
     全ポート × 全ボーレートの組み合わせをスレッドで同時監視する。
@@ -524,7 +532,7 @@ def monitor_all(
         r = PortResult(
             port=port,
             baudrate=baud,
-            port_info=get_port_info(port),
+            port_info=get_port_info(port, port_info_map=port_info_map),
             serial_params={
                 'bytesize': serial_cfg.get('bytesize_label', 8),
                 'parity'  : serial_cfg.get('parity_label',   'N'),
@@ -601,8 +609,8 @@ def print_results(
         print(f"  受信チャンク数: {len(r.chunks)}")
         print(f"  {'-'*50}")
 
-        for i, data in enumerate(r.chunks, start=1):
-            stats = chunk_stats(data, read_mode, encodings)
+        per_chunk_stats = [chunk_stats(data, read_mode, encodings) for data in r.chunks]
+        for i, (data, stats) in enumerate(zip(r.chunks, per_chunk_stats), start=1):
             print(f"  --- チャンク {i} ---")
             print(f"    repr         : {repr(data)}")
             print(f"    hex          : {data.hex(' ')}")
@@ -619,9 +627,8 @@ def print_results(
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
-            all_stats = [chunk_stats(d, read_mode, encodings) for d in r.chunks]
-            payloads = [s['payload_bytes'] for s in all_stats]
-            chars    = [s['char_count'] for s in all_stats if s['char_count'] is not None]
+            payloads = [s['payload_bytes'] for s in per_chunk_stats]
+            chars    = [s['char_count'] for s in per_chunk_stats if s['char_count'] is not None]
             print(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---")
             print(f"    データバイト数: min={min(payloads)}  max={max(payloads)}"
                   f"  avg={sum(payloads)/len(payloads):.1f}")
@@ -849,19 +856,29 @@ def main() -> None:
     else:
         ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False)
 
+    port_info_map = list_port_info_map()
+
     if not ports:
         print("Error: 利用可能なシリアルポートが見つかりませんでした。")
         print("  接続を確認するか、ポートを引数で直接指定してください。")
         sys.exit(1)
 
     if not args.quiet:
-        print_startup_summary(ports, baudrates, read_mode, encodings, no_attr=args.no_attr)
+        print_startup_summary(
+            ports,
+            baudrates,
+            read_mode,
+            encodings,
+            no_attr=args.no_attr,
+            port_info_map=port_info_map,
+        )
 
     # --- 全ポート×全ボーレート同時監視 ---
     results = monitor_all(
         ports, baudrates, args.timeout, args.wait,
         args.lines, read_mode, serial_cfg,
         quiet=args.quiet,
+        port_info_map=port_info_map,
     )
 
     # --- 人間可読な表示 ---
