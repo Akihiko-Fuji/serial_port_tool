@@ -134,6 +134,11 @@ DEFAULT_BAUDRATE   = 9600
 DEFAULT_TIMEOUT    = 0.1
 DEFAULT_WAIT_SEC   = 10
 DEFAULT_ENCODINGS  = ['utf-8', 'shift_jis']  # --encodings のデフォルト値
+NEWLINE_TERMINATORS: Sequence[Tuple[bytes, str]] = (
+    (b'\r\n', "CR+LF (\\r\\n)"),
+    (b'\r', "CR のみ (\\r)"),
+    (b'\n', "LF のみ (\\n)"),
+)
 
 # pyserial の定数マッピング（引数文字列 → serial モジュール定数）
 BYTESIZE_MAP = {
@@ -249,21 +254,17 @@ def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list
 # ==============================
 def check_terminator(data: bytes) -> str:
     """末尾の改行種別を人間が読める文字列で返す"""
-    if data.endswith(b'\r\n'):
-        return "CR+LF (\\r\\n)"
-    elif data.endswith(b'\r'):
-        return "CR のみ (\\r)"
-    elif data.endswith(b'\n'):
-        return "LF のみ (\\n)"
-    else:
-        return "改行なし"
+    for terminator, label in NEWLINE_TERMINATORS:
+        if data.endswith(terminator):
+            return label
+    return "改行なし"
 
 
 def terminator_bytes(data: bytes) -> bytes:
     """末尾の改行バイト列を返す（改行なしは空バイト列）"""
-    for term in (b'\r\n', b'\r', b'\n'):
-        if data.endswith(term):
-            return term
+    for terminator, _ in NEWLINE_TERMINATORS:
+        if data.endswith(terminator):
+            return terminator
     return b''
 
 
@@ -286,7 +287,10 @@ def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
-    return [int(value.strip()) for value in raw.split(',')]
+    baudrates = [int(value.strip()) for value in raw.split(',')]
+    if not baudrates or any(rate <= 0 for rate in baudrates):
+        raise ValueError('invalid baudrate')
+    return baudrates
 
 
 def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
@@ -338,6 +342,111 @@ def build_serial_config(args: argparse.Namespace) -> Dict:
         'parity_label': args.parity,
         'stopbits_label': args.stopbits,
     }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI 引数パーサを構築して返す。"""
+    parser = argparse.ArgumentParser(
+        description='複数シリアルポートを同時監視して、受信データの改行/デリミタ/桁数/文字化けを確認するツール'
+    )
+
+    # --- ポート指定（複数可・ワイルドカード可） ---
+    parser.add_argument(
+        'port', nargs='*', default=[],
+        help="ポート名またはワイルドカード（複数可、省略=自動検索）\n"
+             "例: /dev/rfcomm0  /dev/ttyUSB*  COM3 COM5"
+    )
+
+    # --- ボーレート（複数可） ---
+    parser.add_argument(
+        '-b', '--baudrate', default=str(DEFAULT_BAUDRATE),
+        help="ボーレートをカンマ区切りで指定 (例: 9600,115200)  デフォルト: 9600"
+    )
+
+    # --- 読み取りモード（排他） ---
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        '--newline', action='store_true',
+        help="改行終端モード（デフォルト）: \\n / \\r\\n / \\r を終端として読む"
+    )
+    mode_group.add_argument(
+        '--delimiter',
+        metavar='HEX',
+        help="任意デリミタモード: 終端バイト列を 16 進数で指定 (例: 0D0A = CR+LF, FF)"
+    )
+    mode_group.add_argument(
+        '--chunk', type=int,
+        metavar='N',
+        help="固定長モード: N バイトずつ読む (例: --chunk 16)"
+    )
+
+    # --- 受信制御 ---
+    parser.add_argument(
+        '-n', '--lines', type=int, default=1,
+        help="取得チャンク数（デフォルト: 1）"
+    )
+    parser.add_argument(
+        '-w', '--wait', type=int, default=DEFAULT_WAIT_SEC,
+        help=f"最大待機秒（デフォルト: {DEFAULT_WAIT_SEC}）"
+    )
+    parser.add_argument(
+        '-t', '--timeout', type=float, default=DEFAULT_TIMEOUT,
+        help=f"read() タイムアウト秒（デフォルト: {DEFAULT_TIMEOUT}、通常変更不要）"
+    )
+
+    # --- シリアルパラメータ ---
+    parser.add_argument(
+        '--bytesize', type=int, default=8, choices=[5, 6, 7, 8],
+        help="データビット数（デフォルト: 8）"
+    )
+    parser.add_argument(
+        '--parity', default='N', choices=['N', 'E', 'O', 'M', 'S'],
+        help="パリティ N=なし E=偶数 O=奇数 M=Mark S=Space（デフォルト: N）"
+    )
+    parser.add_argument(
+        '--stopbits', type=float, default=1.0, choices=[1, 1.5, 2],
+        help="ストップビット数（デフォルト: 1）"
+    )
+    parser.add_argument(
+        '--rtscts', action='store_true',
+        help="RTS/CTS ハードウェアフロー制御を有効にする"
+    )
+    parser.add_argument(
+        '--xonxoff', action='store_true',
+        help="XON/XOFF ソフトウェアフロー制御を有効にする"
+    )
+    parser.add_argument(
+        '--dsrdtr', action='store_true',
+        help="DSR/DTR ハードウェアフロー制御を有効にする"
+    )
+
+    # --- デコード ---
+    parser.add_argument(
+        '--encodings', default=None,
+        metavar='ENC,...',
+        help="試みるエンコーディングをカンマ区切りで指定\n"
+             f"デフォルト: {','.join(DEFAULT_ENCODINGS)}\n"
+             "例: --encodings utf-8,cp932,ascii"
+    )
+
+    # --- 出力形式 ---
+    parser.add_argument(
+        '--json', action='store_true',
+        help="結果を JSON 形式で標準出力にも出す"
+    )
+    parser.add_argument(
+        '--json-file', metavar='PATH',
+        help="結果を JSON ファイルに保存する (例: --json-file result.json)"
+    )
+    parser.add_argument(
+        '--quiet', action='store_true',
+        help="進捗ログ（チャンク受信通知・起動メッセージ）を抑制する"
+    )
+    parser.add_argument(
+        '--no-attr', action='store_true',
+        help="ポート属性（VID:PID・メーカー等）の表示を省略する"
+    )
+    return parser
 
 
 def print_startup_summary(
@@ -714,112 +823,7 @@ def build_json(
 # メイン
 # ==============================
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "シリアルポート確認ツール\n"
-            "どのポートからデータが来ているか、デリミタは何か、桁数はどうかを確認する\n"
-            "複数ポート・複数ボーレートを同時監視できる"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    # --- ポート（複数指定可・ワイルドカード可） ---
-    parser.add_argument(
-        'port', nargs='*', default=[],
-        help="ポート名またはワイルドカード（複数可、省略=自動検索）\n"
-             "例: /dev/rfcomm0  /dev/ttyUSB*  COM3 COM5"
-    )
-
-    # --- ボーレート（複数可） ---
-    parser.add_argument(
-        '-b', '--baudrate', default=str(DEFAULT_BAUDRATE),
-        help="ボーレートをカンマ区切りで指定 (例: 9600,115200)  デフォルト: 9600"
-    )
-
-    # --- 読み取りモード（排他） ---
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        '--newline', action='store_true',
-        help="改行終端モード（デフォルト）: \\n / \\r\\n / \\r を終端として読む"
-    )
-    mode_group.add_argument(
-        '--delimiter',
-        metavar='HEX',
-        help="任意デリミタモード: 終端バイト列を 16 進数で指定 (例: 0D0A = CR+LF, FF)"
-    )
-    mode_group.add_argument(
-        '--chunk', type=int,
-        metavar='N',
-        help="固定長モード: N バイトずつ読む (例: --chunk 16)"
-    )
-
-    # --- 受信制御 ---
-    parser.add_argument(
-        '-n', '--lines', type=int, default=1,
-        help="取得チャンク数（デフォルト: 1）"
-    )
-    parser.add_argument(
-        '-w', '--wait', type=int, default=DEFAULT_WAIT_SEC,
-        help=f"最大待機秒（デフォルト: {DEFAULT_WAIT_SEC}）"
-    )
-    parser.add_argument(
-        '-t', '--timeout', type=float, default=DEFAULT_TIMEOUT,
-        help=f"read() タイムアウト秒（デフォルト: {DEFAULT_TIMEOUT}、通常変更不要）"
-    )
-
-    # --- シリアルパラメータ ---
-    parser.add_argument(
-        '--bytesize', type=int, default=8, choices=[5, 6, 7, 8],
-        help="データビット数（デフォルト: 8）"
-    )
-    parser.add_argument(
-        '--parity', default='N', choices=['N', 'E', 'O', 'M', 'S'],
-        help="パリティ N=なし E=偶数 O=奇数 M=Mark S=Space（デフォルト: N）"
-    )
-    parser.add_argument(
-        '--stopbits', type=float, default=1.0, choices=[1, 1.5, 2],
-        help="ストップビット数（デフォルト: 1）"
-    )
-    parser.add_argument(
-        '--rtscts', action='store_true',
-        help="RTS/CTS ハードウェアフロー制御を有効にする"
-    )
-    parser.add_argument(
-        '--xonxoff', action='store_true',
-        help="XON/XOFF ソフトウェアフロー制御を有効にする"
-    )
-    parser.add_argument(
-        '--dsrdtr', action='store_true',
-        help="DSR/DTR ハードウェアフロー制御を有効にする"
-    )
-
-    # --- デコード ---
-    parser.add_argument(
-        '--encodings', default=None,
-        metavar='ENC,...',
-        help="試みるエンコーディングをカンマ区切りで指定\n"
-             f"デフォルト: {','.join(DEFAULT_ENCODINGS)}\n"
-             "例: --encodings utf-8,cp932,ascii"
-    )
-
-    # --- 出力形式 ---
-    parser.add_argument(
-        '--json', action='store_true',
-        help="結果を JSON 形式で標準出力にも出す"
-    )
-    parser.add_argument(
-        '--json-file', metavar='PATH',
-        help="結果を JSON ファイルに保存する (例: --json-file result.json)"
-    )
-    parser.add_argument(
-        '--quiet', action='store_true',
-        help="進捗ログ（チャンク受信通知・起動メッセージ）を抑制する"
-    )
-    parser.add_argument(
-        '--no-attr', action='store_true',
-        help="ポート属性（VID:PID・メーカー等）の表示を省略する"
-    )
-
+    parser = build_parser()
     args = parser.parse_args()
 
     # --- ボーレートのパース ---
