@@ -112,7 +112,7 @@ import argparse
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # ==============================
 # デフォルト設定
@@ -192,6 +192,7 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
          comports() で存在確認だけ行い、一致したポートのみ追加する。
     """
     found = set()
+    known_ports = {info.device for info in serial.tools.list_ports.comports()}
 
     for pattern in (patterns or []):
         expanded = glob.glob(pattern)
@@ -204,16 +205,14 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
         elif explicit:
             # Windows の COM ポートは glob も os.path.exists も効かない。
             # 明示指定時に限り comports() で存在確認して一致分だけ追加する。
-            known = {info.device for info in serial.tools.list_ports.comports()}
-            if pattern in known:
+            if pattern in known_ports:
                 found.add(pattern)
             else:
                 print(f"Warning: 指定ポートが見つかりません: {pattern}")
 
     if not explicit:
         # 自動検索モードのみ全ポートを comports() で補完
-        for info in serial.tools.list_ports.comports():
-            found.add(info.device)
+        found.update(known_ports)
 
     return sorted(found)
 
@@ -274,7 +273,77 @@ def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str
             # LookupError: 不正なエンコーディング名が渡された場合
             pass
     return 'binary', ''
-''
+
+
+def parse_baudrates(raw: str) -> List[int]:
+    """--baudrate の入力文字列を整数リストに変換する。"""
+    return [int(value.strip()) for value in raw.split(',')]
+
+
+def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
+    """引数から読み取りモードを決定する。"""
+    if args.delimiter:
+        delimiter = bytes.fromhex(args.delimiter.replace(' ', ''))
+        return ReadMode(mode='delimiter', delimiter=delimiter)
+    if args.chunk:
+        return ReadMode(mode='chunk', chunk_size=args.chunk)
+    return ReadMode(mode='newline')
+
+
+def parse_encodings(raw: Optional[str]) -> List[str]:
+    """--encodings の入力文字列を正規化して返す。"""
+    if raw is None:
+        return DEFAULT_ENCODINGS
+
+    encodings = [encoding.strip() for encoding in raw.split(',') if encoding.strip()]
+    if not encodings:
+        raise ValueError('empty encodings')
+    return encodings
+
+
+def build_serial_config(args: argparse.Namespace) -> Dict:
+    """pyserial のオープン設定と表示用ラベルを構築する。"""
+    return {
+        'bytesize': BYTESIZE_MAP[args.bytesize],
+        'parity': PARITY_MAP[args.parity],
+        'stopbits': STOPBITS_MAP[args.stopbits],
+        'rtscts': args.rtscts,
+        'xonxoff': args.xonxoff,
+        'dsrdtr': args.dsrdtr,
+        # JSON / 表示用のラベル
+        'bytesize_label': args.bytesize,
+        'parity_label': args.parity,
+        'stopbits_label': args.stopbits,
+    }
+
+
+def print_startup_summary(
+    ports: Sequence[str],
+    baudrates: Sequence[int],
+    read_mode: ReadMode,
+    encodings: Sequence[str],
+    no_attr: bool,
+) -> None:
+    """監視開始前の設定と検出ポート情報を表示する。"""
+    print(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}")
+    print(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}")
+    print(
+        f"読み取りモード   : {read_mode.mode}"
+        + (f" / デリミタ: {read_mode.delimiter.hex(' ').upper()}" if read_mode.mode == 'delimiter' else '')
+        + (f" / {read_mode.chunk_size} bytes" if read_mode.mode == 'chunk' else '')
+    )
+    print(f"エンコーディング : {', '.join(encodings)}")
+
+    if no_attr:
+        return
+
+    print("\n--- 検出ポート属性 ---")
+    for port in ports:
+        info = get_port_info(port)
+        print(f"  {port}")
+        print_port_info(info)
+        if not info:
+            print("    （属性情報なし）")
 
 
 def chunk_stats(data: bytes, read_mode: ReadMode,
@@ -719,46 +788,27 @@ def main() -> None:
 
     # --- ボーレートのパース ---
     try:
-        baudrates = [int(b.strip()) for b in args.baudrate.split(',')]
+        baudrates = parse_baudrates(args.baudrate)
     except ValueError:
         print("Error: --baudrate にはカンマ区切りの整数を指定してください (例: 9600,115200)")
         sys.exit(1)
 
     # --- 読み取りモードの決定 ---
-    if args.delimiter:
-        try:
-            delim_bytes = bytes.fromhex(args.delimiter.replace(' ', ''))
-        except ValueError:
-            print("Error: --delimiter は 16 進数で指定してください (例: 0D0A)")
-            sys.exit(1)
-        read_mode = ReadMode(mode='delimiter', delimiter=delim_bytes)
-    elif args.chunk:
-        read_mode = ReadMode(mode='chunk', chunk_size=args.chunk)
-    else:
-        read_mode = ReadMode(mode='newline')
+    try:
+        read_mode = resolve_read_mode(args)
+    except ValueError:
+        print("Error: --delimiter は 16 進数で指定してください (例: 0D0A)")
+        sys.exit(1)
 
     # --- シリアル設定の組み立て ---
-    serial_cfg = {
-        'bytesize'      : BYTESIZE_MAP[args.bytesize],
-        'parity'        : PARITY_MAP[args.parity],
-        'stopbits'      : STOPBITS_MAP[args.stopbits],
-        'rtscts'        : args.rtscts,
-        'xonxoff'       : args.xonxoff,
-        'dsrdtr'        : args.dsrdtr,
-        # JSON / 表示用のラベル
-        'bytesize_label': args.bytesize,
-        'parity_label'  : args.parity,
-        'stopbits_label': args.stopbits,
-    }
+    serial_cfg = build_serial_config(args)
 
     # --- エンコーディングのパース ---
-    if args.encodings:
-        encodings = [e.strip() for e in args.encodings.split(',') if e.strip()]
-        if not encodings:
-            print("Error: --encodings に有効なエンコーディングを指定してください")
-            sys.exit(1)
-    else:
-        encodings = DEFAULT_ENCODINGS
+    try:
+        encodings = parse_encodings(args.encodings)
+    except ValueError:
+        print("Error: --encodings に有効なエンコーディングを指定してください")
+        sys.exit(1)
 
     # --- ポート解決 ---
     # 明示指定あり（nargs='*' で 1 つ以上渡ってきた場合）
@@ -776,22 +826,7 @@ def main() -> None:
         sys.exit(1)
 
     if not args.quiet:
-        print(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}")
-        print(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}")
-        print(f"読み取りモード   : {read_mode.mode}"
-              + (f" / デリミタ: {read_mode.delimiter.hex(' ').upper()}" if read_mode.mode == 'delimiter' else '')
-              + (f" / {read_mode.chunk_size} bytes" if read_mode.mode == 'chunk' else ''))
-        print(f"エンコーディング : {', '.join(encodings)}")
-
-        # ポート属性情報を先に表示（--no-attr で省略）
-        if not args.no_attr:
-            print("\n--- 検出ポート属性 ---")
-            for p in ports:
-                info = get_port_info(p)
-                print(f"  {p}")
-                print_port_info(info)
-                if not info:
-                    print("    （属性情報なし）")
+        print_startup_summary(ports, baudrates, read_mode, encodings, no_attr=args.no_attr)
 
     # --- 全ポート×全ボーレート同時監視 ---
     results = monitor_all(
