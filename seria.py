@@ -270,11 +270,13 @@ def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str
     for enc in (encodings or DEFAULT_ENCODINGS):
         try:
             return enc, data.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            # LookupError: 不正なエンコーディング名が渡された場合
-            pass
+        except UnicodeDecodeError:
+            # このエンコーディングではデコードできないため次候補へ。
+            continue
+        except LookupError as exc:
+            # 不正なエンコーディング名は握りつぶさずに呼び出し側へ通知する。
+            raise ValueError(f'invalid encoding: {enc}') from exc
     return 'binary', ''
-
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
@@ -466,7 +468,13 @@ def monitor_port(
     start = time.time()
     try:
         while time.time() - start < wait_sec:
-            chunk = read_one_chunk(ser, read_mode)
+            try:
+                chunk = read_one_chunk(ser, read_mode)
+            except ReferenceError as e:
+                # pyserial の内部オブジェクトが GC された場合など、
+                # まれに weakref 由来の ReferenceError が伝播することがある。
+                result.error = f"ReferenceError while reading serial port: {e}"
+                break
             if chunk:
                 collected.append(chunk)
                 if not quiet:
@@ -475,7 +483,12 @@ def monitor_port(
                 if len(collected) >= num_chunks:
                     break
     finally:
-        ser.close()
+        try:
+            ser.close()
+        except ReferenceError:
+            # クローズ時に weakref 由来エラーが発生しても、取得済みデータは保持する。
+            if not result.error:
+                result.error = "ReferenceError while closing serial port"
 
     result.chunks = collected
 
