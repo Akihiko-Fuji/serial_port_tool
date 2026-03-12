@@ -269,7 +269,7 @@ def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str
     """
     for enc in (encodings or DEFAULT_ENCODINGS):
         try:
-            return enc, data.decode(enc).rstrip('\r\n')
+            return enc, data.decode(enc)
         except (UnicodeDecodeError, LookupError):
             # LookupError: 不正なエンコーディング名が渡された場合
             pass
@@ -600,8 +600,9 @@ def print_results(
                 print(f"    デコード     : 失敗（バイナリデータ）")
             else:
                 print(f"    {stats['encoding'].upper():9}    : {stats['decoded']}")
+                bpc_display = f"{stats['bytes_per_char']:.2f}" if stats['bytes_per_char'] is not None else "-"
                 print(f"    文字数       : {stats['char_count']} 文字"
-                      f"  （平均 {stats['bytes_per_char']:.2f} bytes/char）")
+                      f"  （平均 {bpc_display} bytes/char）")
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
