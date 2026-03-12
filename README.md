@@ -34,7 +34,7 @@ pip install pyserial
 
 ## 3. インストール / 配置
 
-Windowsの場合、実行ファイルがありますので[こちら](https://github.com/Akihiko-Fuji/serial_port_tool/blob/411d58521309343136531db4bc73f95f22bc4f0f/seria.zip)からダウンロードして下さい。
+Windowsの場合、実行ファイルがありますので[こちら](https://github.com/Akihiko-Fuji/serial_port_tool/raw/411d58521309343136531db4bc73f95f22bc4f0f/seria.zip)からダウンロードして下さい。
 
 gitの場合は、このリポジトリを取得し、`seria.py` を実行します。
 
