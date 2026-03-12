@@ -223,7 +223,7 @@ def find_ports(
             if pattern in known_port_set:
                 found.add(pattern)
             else:
-                print(f"Warning: 指定ポートが見つかりません: {pattern}")
+                print(f"Warning: 指定ポートが見つかりません: {pattern}", file=sys.stderr)
 
     if not explicit:
         # 自動検索モードのみ全ポートを comports() で補完
@@ -559,7 +559,7 @@ class PortResult:
     port: str
     baudrate: int
     port_info: Dict = field(default_factory=dict)
-    chunks: List[bytes] = field(default_factory=list)
+    chunks: List[Dict] = field(default_factory=list)
     error: str = ''
     serial_params: Dict = field(default_factory=dict)
 
@@ -567,16 +567,50 @@ class PortResult:
 def read_one_chunk(ser: serial.Serial, read_mode: ReadMode) -> bytes:
     """
     読み取りモードに応じて 1 チャンク分のデータを読んで返す。
-      newline  : readline() ― \n を終端として読む
+      newline  : \r\n / \r / \n を終端として読む（自前実装）
       delimiter: read_until() ― 任意バイト列を終端として読む
       chunk    : read(n)    ― 固定長バイト数を読む
     """
     if read_mode.mode == 'newline':
-        return ser.readline()
+        pending = getattr(ser, '_seria_pending', b'')
+        buf = bytearray(pending)
+        setattr(ser, '_seria_pending', b'')
+
+        while True:
+            one = ser.read(1)
+            if not one:
+                return bytes(buf)
+
+            buf += one
+
+            if one == b'\n':
+                return bytes(buf)
+
+            if one == b'\r':
+                next_byte = ser.read(1)
+                if next_byte == b'\n':
+                    buf += next_byte
+                elif next_byte:
+                    setattr(ser, '_seria_pending', next_byte)
+                return bytes(buf)
     elif read_mode.mode == 'delimiter':
         return ser.read_until(expected=read_mode.delimiter)
     else:
         return ser.read(read_mode.chunk_size)
+
+
+def classify_chunk(data: bytes, read_mode: ReadMode) -> Tuple[bool, str]:
+    """受信チャンクが終端まで到達した完全フレームかどうかを返す。"""
+    if read_mode.mode == 'newline':
+        complete = any(data.endswith(t) for t, _ in NEWLINE_TERMINATORS)
+        return complete, ('newline_terminator_found' if complete else 'timeout_partial')
+
+    if read_mode.mode == 'delimiter':
+        complete = data.endswith(read_mode.delimiter)
+        return complete, ('delimiter_found' if complete else 'timeout_partial')
+
+    complete = len(data) == read_mode.chunk_size
+    return complete, ('fixed_size_complete' if complete else 'timeout_partial')
 
 
 def monitor_port(
@@ -608,7 +642,7 @@ def monitor_port(
         result.error = str(e)
         return
 
-    collected: List[bytes] = []
+    collected: List[Dict] = []
     deadline = time.monotonic() + wait_sec
     try:
         while time.monotonic() < deadline:
@@ -620,7 +654,12 @@ def monitor_port(
                 result.error = f"ReferenceError while reading serial port: {e}"
                 break
             if chunk:
-                collected.append(chunk)
+                frame_complete, reason = classify_chunk(chunk, read_mode)
+                collected.append({
+                    'data': chunk,
+                    'frame_complete': frame_complete,
+                    'reason': reason,
+                })
                 if not quiet:
                     with lock:
                         print(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}")
@@ -638,34 +677,23 @@ def monitor_port(
 
 
 # ==============================
-# 全ポート×全ボーレート同時監視
+# ポート単位監視（同一ポート内のボーレート探索は直列）
 # ==============================
-def monitor_all(
-    ports: List[str],
-    baudrates: List[int],
+def monitor_port_all_baudrates(
+    port: str,
+    baudrates: Sequence[int],
     timeout: float,
     wait_sec: int,
     num_chunks: int,
     read_mode: ReadMode,
     serial_cfg: Dict,
+    results: List[PortResult],
+    lock: threading.Lock,
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
-) -> List[PortResult]:
-    """
-    全ポート × 全ボーレートの組み合わせをスレッドで同時監視する。
-    例: 3 ポート × 4 ボーレート = 12 スレッド同時起動
-    quiet=True のときは進捗ログを出さない。
-    """
-    results: List[PortResult] = []
-    lock = threading.Lock()
-    threads = []
-
-    combos = [(p, b) for p in ports for b in baudrates]
-    if not quiet:
-        print(f"\n{len(combos)} 組合せ（{len(ports)} ポート × {len(baudrates)} ボーレート）を同時監視開始"
-              f"（最大 {wait_sec} 秒）…")
-
-    for port, baud in combos:
+) -> None:
+    """1ポートを担当し、指定されたボーレート候補を順に試す。"""
+    for baud in baudrates:
         r = PortResult(
             port=port,
             baudrate=baud,
@@ -679,10 +707,44 @@ def monitor_all(
                 'dsrdtr'  : serial_cfg.get('dsrdtr',          False),
             },
         )
-        results.append(r)
+        monitor_port(
+            port, baud, timeout, wait_sec, num_chunks, read_mode,
+            serial_cfg, r, lock, quiet
+        )
+        with lock:
+            results.append(r)
+
+
+def monitor_all(
+    ports: List[str],
+    baudrates: List[int],
+    timeout: float,
+    wait_sec: int,
+    num_chunks: int,
+    read_mode: ReadMode,
+    serial_cfg: Dict,
+    quiet: bool = False,
+    port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
+) -> List[PortResult]:
+    """
+    ポートごとにスレッドを 1 本ずつ起動し、
+    同一ポート内のボーレート探索は直列で実行する。
+    quiet=True のときは進捗ログを出さない。
+    """
+    results: List[PortResult] = []
+    lock = threading.Lock()
+    threads = []
+
+    combos = [(p, b) for p in ports for b in baudrates]
+    if not quiet:
+        print(f"\n{len(combos)} 組合せ（{len(ports)} ポート × {len(baudrates)} ボーレート）を監視開始"
+              f"（ポート間は並列、同一ポート内は直列 / 最大 {wait_sec} 秒）…")
+
+    for port in ports:
         t = threading.Thread(
-            target=monitor_port,
-            args=(port, baud, timeout, wait_sec, num_chunks, read_mode, serial_cfg, r, lock, quiet),
+            target=monitor_port_all_baudrates,
+            args=(port, baudrates, timeout, wait_sec, num_chunks, read_mode, serial_cfg,
+                  results, lock, quiet, port_info_map),
             daemon=True,
         )
         threads.append(t)
@@ -691,7 +753,7 @@ def monitor_all(
     for t in threads:
         t.join()
 
-    return results
+    return sorted(results, key=lambda r: (r.port, r.baudrate))
 
 
 # ==============================
@@ -746,12 +808,15 @@ def print_results(
         print(f"  受信チャンク数: {len(r.chunks)}")
         print(f"  {'-'*50}")
 
-        per_chunk_stats = [chunk_stats(data, read_mode, encodings) for data in r.chunks]
-        for i, (data, stats) in enumerate(zip(r.chunks, per_chunk_stats), start=1):
+        per_chunk_stats = [chunk_stats(chunk['data'], read_mode, encodings) for chunk in r.chunks]
+        for i, (chunk_item, stats) in enumerate(zip(r.chunks, per_chunk_stats), start=1):
+            data = chunk_item['data']
             print(f"  --- チャンク {i} ---")
             print(f"    repr         : {repr(data)}")
             print(f"    hex          : {data.hex(' ')}")
             print(f"    終端         : {stats['terminator']}")
+            print(f"    完全フレーム : {'Yes' if chunk_item['frame_complete'] else 'No'}"
+                  f"  ({chunk_item['reason']})")
             print(f"    受信バイト数 : {stats['raw_bytes']} bytes"
                   f"  （データ {stats['payload_bytes']} + 終端 {stats['delim_bytes']}）")
             if stats['encoding'] == 'binary':
@@ -805,7 +870,8 @@ def build_json(
     entries = []
     for r in results:
         chunks_data = []
-        for data in r.chunks:
+        for chunk_item in r.chunks:
+            data = chunk_item['data']
             stats = chunk_stats(data, read_mode, encodings)
             chunks_data.append({
                 'repr'          : repr(data),
@@ -818,6 +884,8 @@ def build_json(
                 'decoded'       : stats['decoded'],
                 'char_count'    : stats['char_count'],
                 'bytes_per_char': stats['bytes_per_char'],
+                'frame_complete': chunk_item['frame_complete'],
+                'reason'        : chunk_item['reason'],
             })
         entries.append({
             'port'         : r.port,
@@ -866,6 +934,10 @@ def main() -> None:
         read_mode = resolve_read_mode(args)
     except ValueError:
         print("Error: --delimiter は空でない 16 進数、--chunk は 1 以上の整数を指定してください")
+        sys.exit(1)
+
+    if args.lines <= 0:
+        print("Error: --lines は 1 以上の整数を指定してください", file=sys.stderr)
         sys.exit(1)
 
     # --- シリアル設定の組み立て ---
