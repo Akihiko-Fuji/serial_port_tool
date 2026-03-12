@@ -93,7 +93,7 @@
 #   # 固定長 16 バイトで読む、7E1、RTS/CTS あり
 #   python seria.py /dev/ttyUSB0 --chunk 16 --bytesize 7 --parity E --stopbits 1 --rtscts
 #
-#   # 全ポート・全ボーレードで反応するものを探す、属性省略、JSON 保存
+#   # 全ポート・全ボーレートで反応するものを探す、属性省略、JSON 保存
 #   python seria.py -b 9600,19200,38400,57600,115200 --no-attr --json-file scan.json
 #
 #   # 障害ログ用：静かに動かして JSON だけ残す
@@ -113,7 +113,7 @@ import argparse
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, TextIO, Tuple, TypedDict
 
 # ==============================
 # デフォルト設定
@@ -133,7 +133,7 @@ DEFAULT_PORT_PATTERNS = [
 DEFAULT_BAUDRATE   = 9600
 DEFAULT_TIMEOUT    = 0.1
 DEFAULT_WAIT_SEC   = 10
-DEFAULT_ENCODINGS  = ['utf-8', 'shift_jis']  # --encodings のデフォルト値
+DEFAULT_ENCODINGS: Tuple[str, ...] = ('utf-8', 'shift_jis')  # --encodings のデフォルト値
 NEWLINE_TERMINATORS: Sequence[Tuple[bytes, str]] = (
     (b'\r\n', "CR+LF (\\r\\n)"),
     (b'\r', "CR のみ (\\r)"),
@@ -184,8 +184,13 @@ class LineBufferedReader:
     """改行終端モード用の内部バッファ。"""
     pending: bytearray = field(default_factory=bytearray)
 
-    def read_line(self, ser: serial.Serial) -> bytes:
+    def read_line(self, ser: serial.Serial, deadline: Optional[float] = None) -> bytes:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                if self.pending:
+                    return self._consume(len(self.pending))
+                return b''
+
             for idx, value in enumerate(self.pending):
                 if value == 0x0A:  # LF
                     return self._consume(idx + 1)
@@ -351,7 +356,7 @@ def looks_like_text(decoded: str) -> bool:
     total = len(decoded)
     printable_ratio = printable_count / total
     control_ratio = control_count / total
-    return printable_ratio >= 0.7 and control_ratio <= 0.1
+    return printable_ratio >= 0.95 and control_ratio <= 0.05
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
@@ -364,7 +369,7 @@ def parse_baudrates(raw: str) -> List[int]:
     except ValueError as exc:
         raise ValueError('invalid baudrate') from exc
 
-    if not baudrates or any(rate <= 0 for rate in baudrates):
+    if any(rate <= 0 for rate in baudrates):
         raise ValueError('invalid baudrate')
     return baudrates
 
@@ -396,7 +401,7 @@ def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
 def parse_encodings(raw: Optional[str]) -> List[str]:
     """--encodings の入力文字列を正規化して返す。"""
     if raw is None:
-        return DEFAULT_ENCODINGS
+        return list(DEFAULT_ENCODINGS)
 
     encodings = [encoding.strip() for encoding in raw.split(',') if encoding.strip()]
     if not encodings:
@@ -609,17 +614,28 @@ def chunk_stats(data: bytes, read_mode: ReadMode,
 # ==============================
 # 単一ポート監視（スレッド用）
 # ==============================
+class ChunkRecord(TypedDict):
+    data: bytes
+    frame_complete: bool
+    reason: str
+
+
 @dataclass
 class PortResult:
     port: str
     baudrate: int
     port_info: Dict = field(default_factory=dict)
-    chunks: List[Dict] = field(default_factory=list)
+    chunks: List[ChunkRecord] = field(default_factory=list)
     error: str = ''
     serial_params: Dict = field(default_factory=dict)
 
 
-def read_one_chunk(ser: serial.Serial, read_mode: ReadMode, line_reader: Optional[LineBufferedReader] = None) -> bytes:
+def read_one_chunk(
+    ser: serial.Serial,
+    read_mode: ReadMode,
+    line_reader: LineBufferedReader,
+    deadline: Optional[float] = None,
+) -> bytes:
     """
     読み取りモードに応じて 1 チャンク分のデータを読んで返す。
       newline  : \r\n / \r / \n を終端として読む（自前実装）
@@ -627,8 +643,7 @@ def read_one_chunk(ser: serial.Serial, read_mode: ReadMode, line_reader: Optiona
       chunk    : read(n)    ― 固定長バイト数を読む
     """
     if read_mode.mode == 'newline':
-        reader = line_reader or LineBufferedReader()
-        return reader.read_line(ser)
+        return line_reader.read_line(ser, deadline=deadline)
     elif read_mode.mode == 'delimiter':
         return ser.read_until(expected=read_mode.delimiter)
     else:
@@ -678,13 +693,13 @@ def monitor_port(
         result.error = str(e)
         return
 
-    collected: List[Dict] = []
+    collected: List[ChunkRecord] = []
     line_reader = LineBufferedReader()
     deadline = time.monotonic() + wait_sec
     try:
         while time.monotonic() < deadline:
             try:
-                chunk = read_one_chunk(ser, read_mode, line_reader=line_reader)
+                chunk = read_one_chunk(ser, read_mode, line_reader=line_reader, deadline=deadline)
             except ReferenceError as e:
                 # pyserial の内部オブジェクトが GC された場合など、
                 # まれに weakref 由来の ReferenceError が伝播することがある。
@@ -732,7 +747,10 @@ def monitor_port_all_baudrates(
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
 ) -> None:
-    """1ポートを担当し、指定されたボーレート候補を順に試す。"""
+    """1ポートを担当し、指定されたボーレート候補を順に試す。
+
+    いずれかのボーレートで受信できても探索は止めず、候補を全件試し切る。
+    """
     for baud in baudrates:
         r = PortResult(
             port=port,
@@ -799,10 +817,11 @@ def monitor_all(
 # ==============================
 # 表示
 # ==============================
-def print_port_info(info: Dict, stream=sys.stderr) -> None:
+def print_port_info(info: Dict, stream: Optional[TextIO] = None) -> None:
     """ポート属性情報を表示する"""
     if not info:
         return
+    stream = stream or sys.stderr
     labels = [
         ('VID:PID'     , 'vid_pid'),
         ('メーカー'     , 'manufacturer'),
