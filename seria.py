@@ -272,21 +272,29 @@ def terminator_bytes(data: bytes) -> bytes:
     return b''
 
 
-def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str, str]:
+def decode_data(
+    data: bytes,
+    encodings: Optional[List[str]] = None,
+    strip_newline: bool = True,
+) -> Tuple[str, str]:
     """
     (エンコーディング名, デコード文字列) を返す。失敗時は ('binary', '')。
     encodings には試みるエンコーディングをリストで渡す。
     省略時は DEFAULT_ENCODINGS を使う。
+    strip_newline=True の場合、デコード後文字列の末尾 CR/LF を除去する。
     """
     for enc in (encodings or DEFAULT_ENCODINGS):
         try:
-            return enc, data.decode(enc)
+            decoded = data.decode(enc)
+            if strip_newline:
+                decoded = decoded.rstrip('\r\n')
+            return enc, decoded
         except UnicodeDecodeError:
             # このエンコーディングではデコードできないため次候補へ。
             continue
-        except LookupError as exc:
-            # 不正なエンコーディング名は握りつぶさずに呼び出し側へ通知する。
-            raise ValueError(f'invalid encoding: {enc}') from exc
+        except LookupError:
+            # 不正なエンコーディング名はこの候補のみスキップする。
+            continue
     return 'binary', ''
 
 def parse_baudrates(raw: str) -> List[int]:
@@ -527,9 +535,9 @@ def chunk_stats(data: bytes, read_mode: ReadMode,
     # デコードは終端を除いた payload に対して行う。
     # data 全体に対してデコードすると、終端バイトが CR/LF 以外の任意バイト列の場合に
     # decoded 文字列に終端が混入したり、デコード失敗する可能性がある。
-    enc, decoded = decode_data(payload, encodings)
+    enc, decoded = decode_data(payload, encodings, strip_newline=False)
     char_count = len(decoded) if enc != 'binary' else None
-    bpc = (len(payload) / char_count) if char_count else None
+    bpc = (len(payload) / char_count) if char_count is not None and char_count > 0 else None
 
     return {
         'raw_bytes'     : len(data),
