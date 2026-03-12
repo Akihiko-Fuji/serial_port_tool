@@ -186,7 +186,11 @@ def list_port_info_map() -> Dict[str, serial.tools.list_ports_common.ListPortInf
     return {info.device: info for info in serial.tools.list_ports.comports()}
 
 
-def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> List[str]:
+def find_ports(
+    patterns: Optional[List[str]] = None,
+    explicit: bool = False,
+    known_ports: Optional[Sequence[str]] = None,
+) -> List[str]:
     """
     実在するシリアルポートを返す（重複なし・ソート済み）。
 
@@ -203,7 +207,7 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
          comports() で存在確認だけ行い、一致したポートのみ追加する。
     """
     found = set()
-    known_ports = set(list_port_info_map().keys())
+    known_port_set = set(known_ports) if known_ports is not None else set(list_port_info_map().keys())
 
     for pattern in (patterns or []):
         expanded = glob.glob(pattern)
@@ -216,14 +220,14 @@ def find_ports(patterns: Optional[List[str]] = None, explicit: bool = False) -> 
         elif explicit:
             # Windows の COM ポートは glob も os.path.exists も効かない。
             # 明示指定時に限り comports() で存在確認して一致分だけ追加する。
-            if pattern in known_ports:
+            if pattern in known_port_set:
                 found.add(pattern)
             else:
                 print(f"Warning: 指定ポートが見つかりません: {pattern}")
 
     if not explicit:
         # 自動検索モードのみ全ポートを comports() で補完
-        found.update(known_ports)
+        found.update(known_port_set)
 
     return sorted(found)
 
@@ -287,7 +291,15 @@ def decode_data(data: bytes, encodings: Optional[List[str]] = None) -> Tuple[str
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
-    baudrates = [int(value.strip()) for value in raw.split(',')]
+    segments = [value.strip() for value in raw.split(',')]
+    if not segments or any(not value for value in segments):
+        raise ValueError('invalid baudrate')
+
+    try:
+        baudrates = [int(value) for value in segments]
+    except ValueError as exc:
+        raise ValueError('invalid baudrate') from exc
+
     if not baudrates or any(rate <= 0 for rate in baudrates):
         raise ValueError('invalid baudrate')
     return baudrates
@@ -299,7 +311,15 @@ def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
         delimiter_hex = args.delimiter.replace(' ', '')
         if not delimiter_hex:
             raise ValueError('empty delimiter')
-        delimiter = bytes.fromhex(delimiter_hex)
+
+        try:
+            delimiter = bytes.fromhex(delimiter_hex)
+        except ValueError as exc:
+            raise ValueError('invalid delimiter') from exc
+
+        if not delimiter:
+            raise ValueError('empty delimiter')
+
         return ReadMode(mode='delimiter', delimiter=delimiter)
 
     if args.chunk is not None:
@@ -581,9 +601,9 @@ def monitor_port(
         return
 
     collected: List[bytes] = []
-    start = time.time()
+    deadline = time.monotonic() + wait_sec
     try:
-        while time.time() - start < wait_sec:
+        while time.monotonic() < deadline:
             try:
                 chunk = read_one_chunk(ser, read_mode)
             except ReferenceError as e:
@@ -855,12 +875,13 @@ def main() -> None:
     #   → explicit=True でそのポートだけに絞り込む（他ポートの混入なし）
     # 引数なし（空リスト）
     #   → explicit=False で DEFAULT_PORT_PATTERNS + list_ports による自動検索
-    if args.port:
-        ports = find_ports(args.port, explicit=True)
-    else:
-        ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False)
-
     port_info_map = list_port_info_map()
+    known_ports = list(port_info_map.keys())
+
+    if args.port:
+        ports = find_ports(args.port, explicit=True, known_ports=known_ports)
+    else:
+        ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports)
 
     if not ports:
         print("Error: 利用可能なシリアルポートが見つかりませんでした。")
