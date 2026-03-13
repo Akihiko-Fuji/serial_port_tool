@@ -212,6 +212,7 @@ class LineBufferedReader:
                 if self.pending:
                     if trailing_cr and deadline is not None and time.monotonic() < deadline:
                         continue
+                    # deadline=None のときは待機を続けず、末尾 CR を含む pending を返す。
                     return self._consume(len(self.pending))
                 return b''
             self.pending.extend(chunk)
@@ -318,13 +319,12 @@ def terminator_bytes(data: bytes) -> bytes:
 
 def decode_data(
     data: bytes,
-    encodings: Optional[List[str]] = None,
+    encodings: Sequence[str] = DEFAULT_ENCODINGS,
     strip_newline: bool = True,
 ) -> Tuple[str, str]:
     """
     (エンコーディング名, デコード文字列) を返す。失敗時は ('binary', '')。
-    encodings には試みるエンコーディングをリストで渡す。
-    省略時は DEFAULT_ENCODINGS を使う。
+    encodings には試みるエンコーディングをシーケンスで渡す。
     strip_newline=True の場合、デコード後文字列の末尾 CR/LF を除去する。
     """
     if b'\x00' in data:
@@ -577,7 +577,7 @@ def print_startup_summary(
 
 
 def chunk_stats(data: bytes, read_mode: ReadMode,
-                encodings: Optional[List[str]] = None) -> Dict:
+                encodings: Sequence[str] = DEFAULT_ENCODINGS) -> Dict:
     """
     1 チャンク分のバイト数・文字数統計を返す。
       raw_bytes     : 受信バイト数（デリミタ込み）
@@ -587,7 +587,7 @@ def chunk_stats(data: bytes, read_mode: ReadMode,
       char_count    : デコード後の文字数（バイナリは None）
       bytes_per_char: 平均バイト/文字（バイナリは None）
       terminator    : 末尾の改行種別文字列（newline モード以外は種別説明）
-    encodings には試みるエンコーディングをリストで渡す（省略時は DEFAULT_ENCODINGS）。
+    encodings には試みるエンコーディングをシーケンスで渡す。
     """
     if read_mode.mode == 'newline':
         term_b = terminator_bytes(data)
@@ -635,7 +635,7 @@ class PortResult:
     baudrate: int
     port_info: Dict = field(default_factory=dict)
     chunks: List[ChunkRecord] = field(default_factory=list)
-    error: str = ''
+    error: Optional[str] = None
     serial_params: Dict = field(default_factory=dict)
 
 
@@ -849,18 +849,19 @@ def print_results(
     read_mode: ReadMode,
     encodings: Sequence[str],
     no_attr: bool = False,
-    errors_only: bool = False,
+    quiet: bool = False,
 ) -> None:
     """
     人間可読な形式でサマリーを表示する。
     no_attr=True のときはポート属性（VID:PID・メーカー等）を省略する。
+    quiet=True のときは通常結果を抑制し、シリアルエラーのみを表示する。
     encodings はデコード候補リスト。
     """
     active = [r for r in results if r.chunks]
     silent = [r for r in results if not r.chunks and not r.error]
     errors = [r for r in results if r.error]
 
-    if errors_only:
+    if quiet:
         if errors:
             print("\n【シリアルエラー（オープン/読み取り/クローズ）】", file=sys.stderr)
             for r in errors:
@@ -967,8 +968,9 @@ def build_json(
             'baudrate'     : r.baudrate,
             'serial_params': r.serial_params,
             'port_info'    : r.port_info,
-            'status'       : 'active' if r.chunks else ('error' if r.error else 'silent'),
-            'error'        : r.error or None,
+            'has_data'     : bool(r.chunks),
+            'has_error'    : bool(r.error),
+            'error'        : r.error,
             'chunk_count'  : len(r.chunks),
             'chunks'       : chunks_data,
         })
@@ -1068,7 +1070,7 @@ def main() -> None:
         read_mode,
         encodings=encodings,
         no_attr=args.no_attr,
-        errors_only=args.quiet,
+        quiet=args.quiet,
     )
 
     # --- JSON 出力 ---
