@@ -156,6 +156,7 @@ STOPBITS_MAP = {
     1.5: serial.STOPBITS_ONE_POINT_FIVE,
     2:   serial.STOPBITS_TWO,
 }
+# DSR/DTR フロー制御は bool フラグで serial.Serial に渡すため定数マップは不要
 
 Language = Literal['ja', 'en']
 
@@ -167,10 +168,10 @@ def tr(ja: str, en: str, lang: Language) -> str:
 
 def should_use_english_console() -> bool:
     """Linux ローカルのプレーンコンソール（TERM=linux）では英語表示に切り替える。"""
-    force_lang = os.environ.get('SERIA_FORCE_LANG', '').lower()
-    if force_lang in {'ja', 'jp'}:
+    forced_lang = os.environ.get('SERIA_FORCE_LANG', '').strip().lower()
+    if forced_lang in {'ja', 'jp'}:
         return False
-    if force_lang in {'en', 'english'}:
+    if forced_lang in {'en', 'english'}:
         return True
 
     # 要件:
@@ -180,10 +181,10 @@ def should_use_english_console() -> bool:
     # - Linux ローカルのプレーンコンソールのみ英語
     if not sys.platform.startswith('linux'):
         return False
-    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
+    has_ssh_session = bool(os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'))
+    if has_ssh_session:
         return False
     return os.environ.get('TERM') == 'linux'
-# DSR/DTR フロー制御は bool フラグで serial.Serial に渡すため定数マップは不要
 
 
 # ==============================
