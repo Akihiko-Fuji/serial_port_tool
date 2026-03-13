@@ -1068,7 +1068,6 @@ def frame_reason_label(reason: FrameReason, lang: Language) -> str:
 
 def print_results(
     results: List[PortResult],
-    read_mode: ReadMode,
     no_attr: bool = False,
     quiet: bool = False,
     lang: Language = 'ja',
@@ -1192,7 +1191,6 @@ def build_json(
     meta には調査パラメータ（wait / timeout / delimiter / requested_ports / baudrates 等）を渡す。
     """
     entries = [r.to_json_dict() for r in results]
-
 
     # metadata: 調査パラメータをまとめて調査ログとして完結させる
     metadata = {
@@ -1335,7 +1333,6 @@ def main() -> None:
     # --- 人間可読な表示 ---
     print_results(
         results,
-        app_cfg.read_mode,
         no_attr=app_cfg.no_attr,
         quiet=app_cfg.quiet,
         lang=app_cfg.lang,
@@ -1350,7 +1347,6 @@ def main() -> None:
             'wait_sec'         : app_cfg.wait_sec,
             'timeout_sec'      : app_cfg.timeout_sec,
             'num_chunks'       : app_cfg.lines,
-            'encodings'        : app_cfg.encodings,
             'serial_bytesize'  : app_cfg.serial_config.bytesize_label,
             'serial_parity'    : app_cfg.serial_config.parity_label,
             'serial_stopbits'  : app_cfg.serial_config.stopbits_label,
