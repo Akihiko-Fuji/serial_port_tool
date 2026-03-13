@@ -135,11 +135,7 @@ DEFAULT_BAUDRATE   = 9600
 DEFAULT_TIMEOUT    = 0.1
 DEFAULT_WAIT_SEC   = 10
 DEFAULT_ENCODINGS: Tuple[str, ...] = ('utf-8', 'shift_jis')  # --encodings のデフォルト値
-NEWLINE_TERMINATORS: Sequence[Tuple[bytes, str]] = (
-    (b'\r\n', "CR+LF (\\r\\n)"),
-    (b'\r', "CR のみ (\\r)"),
-    (b'\n', "LF のみ (\\n)"),
-)
+NEWLINE_TERMINATORS: Sequence[bytes] = (b'\r\n', b'\r', b'\n')
 
 # pyserial の定数マッピング（引数文字列 → serial モジュール定数）
 BYTESIZE_MAP = {
@@ -381,15 +377,19 @@ def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list
 # ==============================
 def check_terminator(data: bytes, lang: Language = 'ja') -> str:
     """末尾の改行種別を人間が読める文字列で返す"""
-    for terminator, label in NEWLINE_TERMINATORS:
-        if data.endswith(terminator):
-            return label
+    term = terminator_bytes(data)
+    if term == b'\r\n':
+        return tr("CR+LF (\\r\\n)", "CR+LF (\\r\\n)", lang=lang)
+    if term == b'\r':
+        return tr("CR のみ (\\r)", "CR only (\\r)", lang=lang)
+    if term == b'\n':
+        return tr("LF のみ (\\n)", "LF only (\\n)", lang=lang)
     return tr("改行なし", "No newline", lang=lang)
 
 
 def terminator_bytes(data: bytes) -> bytes:
     """末尾の改行バイト列を返す（改行なしは空バイト列）"""
-    for terminator, _ in NEWLINE_TERMINATORS:
+    for terminator in NEWLINE_TERMINATORS:
         if data.endswith(terminator):
             return terminator
     return b''
@@ -683,7 +683,8 @@ def chunk_stats(
         terminator_label = check_terminator(data, lang=lang)
     elif read_mode.mode == 'delimiter':
         delim_len = len(read_mode.delimiter) if data.endswith(read_mode.delimiter) else 0
-        terminator_label = f"delimiter ({read_mode.delimiter.hex(' ').upper()})"
+        delim_hex = read_mode.delimiter.hex(' ').upper()
+        terminator_label = tr(f"デリミタ ({delim_hex})", f"Delimiter ({delim_hex})", lang=lang)
     else:  # chunk
         delim_len = 0
         terminator_label = tr(f"固定長 {read_mode.chunk_size} bytes", f"fixed length {read_mode.chunk_size} bytes", lang=lang)
@@ -753,7 +754,7 @@ def read_one_chunk(
 def classify_chunk(data: bytes, read_mode: ReadMode) -> Tuple[bool, str]:
     """受信チャンクが終端まで到達した完全フレームかどうかを返す。"""
     if read_mode.mode == 'newline':
-        complete = any(data.endswith(t) for t, _ in NEWLINE_TERMINATORS)
+        complete = any(data.endswith(t) for t in NEWLINE_TERMINATORS)
         return complete, ('newline_terminator_found' if complete else 'timeout_partial')
 
     if read_mode.mode == 'delimiter':
@@ -939,7 +940,7 @@ def print_port_info(info: Dict, stream: Optional[TextIO] = None, lang: Language 
 def print_results(
     results: List[PortResult],
     read_mode: ReadMode,
-    per_chunk_stats: Dict[Tuple[str, int, int], ChunkStats],
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     no_attr: bool = False,
     quiet: bool = False,
     lang: Language = 'ja',
@@ -965,6 +966,7 @@ def print_results(
     print("=" * 56, file=sys.stderr)
 
     for r in active:
+        owner_key = id(r)
         print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps", lang=lang), file=sys.stderr)
         params = r.serial_params
         serial_ja = (
@@ -986,7 +988,7 @@ def print_results(
         print(f"  {'-'*50}", file=sys.stderr)
 
         for i, chunk_item in enumerate(r.chunks, start=1):
-            stats = per_chunk_stats[(r.port, r.baudrate, i - 1)]
+            stats = per_chunk_stats[(owner_key, i - 1)]
             data = chunk_item['data']
             print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---", lang=lang), file=sys.stderr)
             print(f"    repr         : {repr(data)}", file=sys.stderr)
@@ -1015,7 +1017,7 @@ def print_results(
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
-            chunk_stats_list = [per_chunk_stats[(r.port, r.baudrate, idx)] for idx in range(len(r.chunks))]
+            chunk_stats_list = [per_chunk_stats[(owner_key, idx)] for idx in range(len(r.chunks))]
             payloads = [s.payload_bytes for s in chunk_stats_list]
             chars    = [s.char_count for s in chunk_stats_list if s.char_count is not None]
             print(tr(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", f"\n  --- Statistics ({len(r.chunks)} chunks) ---", lang=lang), file=sys.stderr)
@@ -1053,7 +1055,7 @@ def print_results(
 def build_json(
     results: List[PortResult],
     read_mode: ReadMode,
-    per_chunk_stats: Dict[Tuple[str, int, int], ChunkStats],
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     encodings: Sequence[str],
     meta: Optional[Dict] = None,
 ) -> Dict:
@@ -1063,10 +1065,11 @@ def build_json(
     """
     entries = []
     for r in results:
+        owner_key = id(r)
         chunks_data = []
         for chunk_index, chunk_item in enumerate(r.chunks):
             data = chunk_item['data']
-            stats = per_chunk_stats[(r.port, r.baudrate, chunk_index)]
+            stats = per_chunk_stats[(owner_key, chunk_index)]
             chunks_data.append({
                 'repr'          : repr(data),
                 'hex'           : data.hex(' '),
@@ -1136,6 +1139,16 @@ def build_app_config(args: argparse.Namespace, lang: Language) -> AppConfig:
         raise ConfigError(
             ja="Error: --lines は 1 以上の整数を指定してください",
             en="Error: --lines must be an integer >= 1",
+        )
+    if args.wait < 0:
+        raise ConfigError(
+            ja="Error: --wait は 0 以上の整数を指定してください",
+            en="Error: --wait must be an integer >= 0",
+        )
+    if args.timeout < 0:
+        raise ConfigError(
+            ja="Error: --timeout は 0 以上の数値を指定してください",
+            en="Error: --timeout must be a number >= 0",
         )
 
     serial_cfg = build_serial_config(
@@ -1217,10 +1230,11 @@ def main() -> None:
         lang=app_cfg.lang,
     )
 
-    per_chunk_stats: Dict[Tuple[str, int, int], ChunkStats] = {}
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats] = {}
     for result in results:
+        owner_key = id(result)
         for chunk_index, chunk_item in enumerate(result.chunks):
-            per_chunk_stats[(result.port, result.baudrate, chunk_index)] = chunk_stats(
+            per_chunk_stats[(owner_key, chunk_index)] = chunk_stats(
                 chunk_item['data'], app_cfg.read_mode, app_cfg.encodings, lang=app_cfg.lang
             )
 
