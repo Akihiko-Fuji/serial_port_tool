@@ -249,6 +249,12 @@ class PortInfo:
             'interface': self.interface,
         }
 
+    def is_empty(self) -> bool:
+        return not any(self.to_dict().values())
+
+    def __bool__(self) -> bool:
+        return not self.is_empty()
+
 
 @dataclass(frozen=True)
 class SerialParams:
@@ -1050,6 +1056,16 @@ def msg_serial_errors(lang: Language) -> str:
     return tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang)
 
 
+def frame_reason_label(reason: FrameReason, lang: Language) -> str:
+    labels = {
+        FrameReason.NEWLINE_FOUND: tr("改行終端を検出", "newline terminator found", lang=lang),
+        FrameReason.DELIMITER_FOUND: tr("デリミタを検出", "delimiter found", lang=lang),
+        FrameReason.FIXED_SIZE_COMPLETE: tr("固定長を満たした", "fixed size complete", lang=lang),
+        FrameReason.TIMEOUT_PARTIAL: tr("タイムアウトで部分受信", "timeout partial", lang=lang),
+    }
+    return labels[reason]
+
+
 def print_results(
     results: List[PortResult],
     read_mode: ReadMode,
@@ -1105,9 +1121,11 @@ def print_results(
             print(f"    repr         : {repr(data)}", file=sys.stderr)
             print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
             print(tr(f"    終端         : {stats.terminator}", f"    Terminator   : {stats.terminator}", lang=lang), file=sys.stderr)
+            frame_complete_label = tr('はい' if chunk_item.frame_complete else 'いいえ', 'Yes' if chunk_item.frame_complete else 'No', lang=lang)
+            reason_label = frame_reason_label(chunk_item.reason, lang=lang)
             print(tr(
-                f"    完全フレーム : {'Yes' if chunk_item.frame_complete else 'No'}  ({chunk_item.reason.value})",
-                f"    Full frame   : {'Yes' if chunk_item.frame_complete else 'No'}  ({chunk_item.reason.value})",
+                f"    完全フレーム : {frame_complete_label}  ({reason_label})",
+                f"    Full frame   : {frame_complete_label}  ({reason_label})",
                 lang=lang
             ), file=sys.stderr)
             print(tr(
