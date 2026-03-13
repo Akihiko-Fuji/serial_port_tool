@@ -724,6 +724,7 @@ class PortResult:
     baudrate: int
     port_info: Dict[str, Optional[str]] = field(default_factory=dict)
     chunks: List[ChunkRecord] = field(default_factory=list)
+    chunk_stats_list: List[ChunkStats] = field(default_factory=list)
     error: Optional[str] = None
     serial_params: Dict[str, object] = field(default_factory=dict)
 
@@ -840,17 +841,16 @@ def monitor_port_all_baudrates(
     num_chunks: int,
     read_mode: ReadMode,
     serial_cfg: SerialConfig,
+    log_lock: threading.Lock,
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
     lang: Language = 'ja',
-    log_lock: Optional[threading.Lock] = None,
 ) -> List[PortResult]:
     """1ポートを担当し、指定されたボーレート候補を順に試す。
 
     いずれかのボーレートで受信できても探索は止めず、候補を全件試し切る。
     """
     per_port_results: List[PortResult] = []
-    effective_lock = log_lock or threading.Lock()
     for baud in baudrates:
         r = PortResult(
             port=port,
@@ -867,7 +867,7 @@ def monitor_port_all_baudrates(
         )
         monitor_port(
             port, baud, timeout, wait_sec, num_chunks, read_mode,
-            serial_cfg, r, effective_lock, quiet, lang=lang
+            serial_cfg, r, log_lock, quiet, lang=lang
         )
         per_port_results.append(r)
     return per_port_results
@@ -905,7 +905,7 @@ def monitor_all(
             executor.submit(
                 monitor_port_all_baudrates,
                 port, baudrates, timeout, wait_sec, num_chunks, read_mode,
-                serial_cfg, quiet, port_info_map, lang, log_lock
+                serial_cfg, log_lock, quiet, port_info_map, lang
             )
             for port in ports
         ]
@@ -940,7 +940,6 @@ def print_port_info(info: Dict, stream: Optional[TextIO] = None, lang: Language 
 def print_results(
     results: List[PortResult],
     read_mode: ReadMode,
-    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     no_attr: bool = False,
     quiet: bool = False,
     lang: Language = 'ja',
@@ -966,7 +965,6 @@ def print_results(
     print("=" * 56, file=sys.stderr)
 
     for r in active:
-        owner_key = id(r)
         print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps", lang=lang), file=sys.stderr)
         params = r.serial_params
         serial_ja = (
@@ -988,7 +986,7 @@ def print_results(
         print(f"  {'-'*50}", file=sys.stderr)
 
         for i, chunk_item in enumerate(r.chunks, start=1):
-            stats = per_chunk_stats[(owner_key, i - 1)]
+            stats = r.chunk_stats_list[i - 1]
             data = chunk_item['data']
             print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---", lang=lang), file=sys.stderr)
             print(f"    repr         : {repr(data)}", file=sys.stderr)
@@ -1017,7 +1015,7 @@ def print_results(
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
-            chunk_stats_list = [per_chunk_stats[(owner_key, idx)] for idx in range(len(r.chunks))]
+            chunk_stats_list = r.chunk_stats_list
             payloads = [s.payload_bytes for s in chunk_stats_list]
             chars    = [s.char_count for s in chunk_stats_list if s.char_count is not None]
             print(tr(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", f"\n  --- Statistics ({len(r.chunks)} chunks) ---", lang=lang), file=sys.stderr)
@@ -1055,7 +1053,6 @@ def print_results(
 def build_json(
     results: List[PortResult],
     read_mode: ReadMode,
-    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     encodings: Sequence[str],
     meta: Optional[Dict] = None,
 ) -> Dict:
@@ -1065,11 +1062,10 @@ def build_json(
     """
     entries = []
     for r in results:
-        owner_key = id(r)
         chunks_data = []
         for chunk_index, chunk_item in enumerate(r.chunks):
             data = chunk_item['data']
-            stats = per_chunk_stats[(owner_key, chunk_index)]
+            stats = r.chunk_stats_list[chunk_index]
             chunks_data.append({
                 'repr'          : repr(data),
                 'hex'           : data.hex(' '),
@@ -1230,19 +1226,16 @@ def main() -> None:
         lang=app_cfg.lang,
     )
 
-    per_chunk_stats: Dict[Tuple[int, int], ChunkStats] = {}
     for result in results:
-        owner_key = id(result)
-        for chunk_index, chunk_item in enumerate(result.chunks):
-            per_chunk_stats[(owner_key, chunk_index)] = chunk_stats(
-                chunk_item['data'], app_cfg.read_mode, app_cfg.encodings, lang=app_cfg.lang
-            )
+        result.chunk_stats_list = [
+            chunk_stats(chunk_item['data'], app_cfg.read_mode, app_cfg.encodings, lang=app_cfg.lang)
+            for chunk_item in result.chunks
+        ]
 
     # --- 人間可読な表示 ---
     print_results(
         results,
         app_cfg.read_mode,
-        per_chunk_stats=per_chunk_stats,
         no_attr=app_cfg.no_attr,
         quiet=app_cfg.quiet,
         lang=app_cfg.lang,
@@ -1265,7 +1258,7 @@ def main() -> None:
             'serial_xonxoff'   : app_cfg.serial_config.xonxoff,
             'serial_dsrdtr'    : app_cfg.serial_config.dsrdtr,
         }
-        payload = build_json(results, app_cfg.read_mode, per_chunk_stats=per_chunk_stats, encodings=app_cfg.encodings, meta=json_meta)
+        payload = build_json(results, app_cfg.read_mode, encodings=app_cfg.encodings, meta=json_meta)
         if app_cfg.json_stdout:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         if app_cfg.json_file:
