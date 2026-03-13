@@ -111,6 +111,7 @@ import glob
 import json
 import argparse
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Literal, Optional, Sequence, TextIO, Tuple, TypedDict
@@ -134,11 +135,7 @@ DEFAULT_BAUDRATE   = 9600
 DEFAULT_TIMEOUT    = 0.1
 DEFAULT_WAIT_SEC   = 10
 DEFAULT_ENCODINGS: Tuple[str, ...] = ('utf-8', 'shift_jis')  # --encodings のデフォルト値
-NEWLINE_TERMINATORS: Sequence[Tuple[bytes, str]] = (
-    (b'\r\n', "CR+LF (\\r\\n)"),
-    (b'\r', "CR のみ (\\r)"),
-    (b'\n', "LF のみ (\\n)"),
-)
+NEWLINE_TERMINATORS: Sequence[bytes] = (b'\r\n', b'\r', b'\n')
 
 # pyserial の定数マッピング（引数文字列 → serial モジュール定数）
 BYTESIZE_MAP = {
@@ -160,12 +157,12 @@ STOPBITS_MAP = {
     2:   serial.STOPBITS_TWO,
 }
 
-OUTPUT_LANG: Literal['ja', 'en'] = 'ja'
+Language = Literal['ja', 'en']
 
 
-def tr(ja: str, en: str) -> str:
+def tr(ja: str, en: str, lang: Language) -> str:
     """現在の表示言語設定に応じてメッセージを返す。"""
-    return ja if OUTPUT_LANG == 'ja' else en
+    return ja if lang == 'ja' else en
 
 
 def should_use_english_console() -> bool:
@@ -204,6 +201,55 @@ class ReadMode:
     delimiter: bytes = b''
     chunk_size: int = 0
     selected_by_user: bool = False
+
+
+@dataclass(frozen=True)
+class SerialConfig:
+    bytesize: int
+    parity: str
+    stopbits: float
+    rtscts: bool
+    xonxoff: bool
+    dsrdtr: bool
+    bytesize_label: int
+    parity_label: str
+    stopbits_label: float
+
+
+@dataclass(frozen=True)
+class ChunkStats:
+    raw_bytes: int
+    delim_bytes: int
+    payload_bytes: int
+    encoding: str
+    char_count: Optional[int]
+    bytes_per_char: Optional[float]
+    terminator: str
+    decoded: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    requested_ports: List[str]
+    baudrates: List[int]
+    read_mode: ReadMode
+    lines: int
+    wait_sec: int
+    timeout_sec: float
+    serial_config: SerialConfig
+    encodings: List[str]
+    json_stdout: bool
+    json_file: Optional[str]
+    quiet: bool
+    no_attr: bool
+    lang: Language
+
+
+@dataclass(frozen=True)
+class ConfigError(Exception):
+    """CLI 設定解決中に発生した利用者向けエラー。"""
+    ja: str
+    en: str
 
 
 @dataclass
@@ -262,6 +308,7 @@ def find_ports(
     patterns: Optional[List[str]] = None,
     explicit: bool = False,
     known_ports: Optional[Sequence[str]] = None,
+    lang: Language = 'ja',
 ) -> List[str]:
     """
     実在するシリアルポートを返す（重複なし・ソート済み）。
@@ -295,7 +342,7 @@ def find_ports(
             if pattern in known_port_set:
                 found.add(pattern)
             else:
-                print(tr(f"Warning: 指定ポートが見つかりません: {pattern}", f"Warning: specified port not found: {pattern}"), file=sys.stderr)
+                print(tr(f"Warning: 指定ポートが見つかりません: {pattern}", f"Warning: specified port not found: {pattern}", lang=lang), file=sys.stderr)
 
     if not explicit:
         # 自動検索モードのみ全ポートを comports() で補完
@@ -328,17 +375,21 @@ def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list
 # ==============================
 # データ解析ユーティリティ
 # ==============================
-def check_terminator(data: bytes) -> str:
+def check_terminator(data: bytes, lang: Language = 'ja') -> str:
     """末尾の改行種別を人間が読める文字列で返す"""
-    for terminator, label in NEWLINE_TERMINATORS:
-        if data.endswith(terminator):
-            return label
-    return tr("改行なし", "No newline")
+    term = terminator_bytes(data)
+    if term == b'\r\n':
+        return tr("CR+LF (\\r\\n)", "CR+LF (\\r\\n)", lang=lang)
+    if term == b'\r':
+        return tr("CR のみ (\\r)", "CR only (\\r)", lang=lang)
+    if term == b'\n':
+        return tr("LF のみ (\\n)", "LF only (\\n)", lang=lang)
+    return tr("改行なし", "No newline", lang=lang)
 
 
 def terminator_bytes(data: bytes) -> bytes:
     """末尾の改行バイト列を返す（改行なしは空バイト列）"""
-    for terminator, _ in NEWLINE_TERMINATORS:
+    for terminator in NEWLINE_TERMINATORS:
         if data.endswith(terminator):
             return terminator
     return b''
@@ -410,10 +461,10 @@ def parse_baudrates(raw: str) -> List[int]:
     return baudrates
 
 
-def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
+def resolve_read_mode(delimiter_arg: Optional[str], chunk_arg: Optional[int], newline_arg: bool) -> ReadMode:
     """引数から読み取りモードを決定する。"""
-    if args.delimiter is not None:
-        delimiter_hex = args.delimiter.replace(' ', '')
+    if delimiter_arg is not None:
+        delimiter_hex = delimiter_arg.replace(' ', '')
         if not delimiter_hex:
             raise ValueError('empty delimiter')
 
@@ -427,11 +478,11 @@ def resolve_read_mode(args: argparse.Namespace) -> ReadMode:
 
         return ReadMode(mode='delimiter', delimiter=delimiter, selected_by_user=True)
 
-    if args.chunk is not None:
-        if args.chunk <= 0:
+    if chunk_arg is not None:
+        if chunk_arg <= 0:
             raise ValueError('invalid chunk size')
-        return ReadMode(mode='chunk', chunk_size=args.chunk, selected_by_user=True)
-    return ReadMode(mode='newline', selected_by_user=args.newline)
+        return ReadMode(mode='chunk', chunk_size=chunk_arg, selected_by_user=True)
+    return ReadMode(mode='newline', selected_by_user=newline_arg)
 
 
 def parse_encodings(raw: Optional[str]) -> List[str]:
@@ -452,20 +503,19 @@ def parse_encodings(raw: Optional[str]) -> List[str]:
     return encodings
 
 
-def build_serial_config(args: argparse.Namespace) -> Dict:
+def build_serial_config(bytesize: int, parity: str, stopbits: float, rtscts: bool, xonxoff: bool, dsrdtr: bool) -> SerialConfig:
     """pyserial のオープン設定と表示用ラベルを構築する。"""
-    return {
-        'bytesize': BYTESIZE_MAP[args.bytesize],
-        'parity': PARITY_MAP[args.parity],
-        'stopbits': STOPBITS_MAP[args.stopbits],
-        'rtscts': args.rtscts,
-        'xonxoff': args.xonxoff,
-        'dsrdtr': args.dsrdtr,
-        # JSON / 表示用のラベル
-        'bytesize_label': args.bytesize,
-        'parity_label': args.parity,
-        'stopbits_label': args.stopbits,
-    }
+    return SerialConfig(
+        bytesize=BYTESIZE_MAP[bytesize],
+        parity=PARITY_MAP[parity],
+        stopbits=STOPBITS_MAP[stopbits],
+        rtscts=rtscts,
+        xonxoff=xonxoff,
+        dsrdtr=dsrdtr,
+        bytesize_label=bytesize,
+        parity_label=parity,
+        stopbits_label=stopbits,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -580,10 +630,11 @@ def print_startup_summary(
     encodings: Sequence[str],
     no_attr: bool,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
+    lang: Language = 'ja',
 ) -> None:
     """監視開始前の設定と検出ポート情報を表示する。"""
-    print(tr(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}", f"Detected ports ({len(ports)}): {', '.join(ports)}"), file=sys.stderr)
-    print(tr(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}", f"Baudrate candidates ({len(baudrates)}): {', '.join(str(b) for b in baudrates)}"), file=sys.stderr)
+    print(tr(f"検出されたポート  ({len(ports)} 件): {', '.join(ports)}", f"Detected ports ({len(ports)}): {', '.join(ports)}", lang=lang), file=sys.stderr)
+    print(tr(f"ボーレート候補    ({len(baudrates)} 件): {', '.join(str(b) for b in baudrates)}", f"Baudrate candidates ({len(baudrates)}): {', '.join(str(b) for b in baudrates)}", lang=lang), file=sys.stderr)
     print(
         tr(
             f"読み取りモード   : {read_mode.mode}"
@@ -592,25 +643,29 @@ def print_startup_summary(
             f"Read mode: {read_mode.mode}"
             + (f" / delimiter: {read_mode.delimiter.hex(' ').upper()}" if read_mode.mode == 'delimiter' else '')
             + (f" / {read_mode.chunk_size} bytes" if read_mode.mode == 'chunk' else '')
-        ),
+        , lang=lang),
         file=sys.stderr
     )
-    print(tr(f"エンコーディング : {', '.join(encodings)}", f"Encodings: {', '.join(encodings)}"), file=sys.stderr)
+    print(tr(f"エンコーディング : {', '.join(encodings)}", f"Encodings: {', '.join(encodings)}", lang=lang), file=sys.stderr)
 
     if no_attr:
         return
 
-    print(tr("\n--- 検出ポート属性 ---", "\n--- Detected port attributes ---"), file=sys.stderr)
+    print(tr("\n--- 検出ポート属性 ---", "\n--- Detected port attributes ---", lang=lang), file=sys.stderr)
     for port in ports:
         info = get_port_info(port, port_info_map=port_info_map)
         print(f"  {port}", file=sys.stderr)
-        print_port_info(info, stream=sys.stderr)
+        print_port_info(info, stream=sys.stderr, lang=lang)
         if not info:
-            print(tr("    （属性情報なし）", "    (No attribute info)"), file=sys.stderr)
+            print(tr("    （属性情報なし）", "    (No attribute info)", lang=lang), file=sys.stderr)
 
 
-def chunk_stats(data: bytes, read_mode: ReadMode,
-                encodings: Sequence[str] = DEFAULT_ENCODINGS) -> Dict:
+def chunk_stats(
+    data: bytes,
+    read_mode: ReadMode,
+    encodings: Sequence[str] = DEFAULT_ENCODINGS,
+    lang: Language = 'ja',
+) -> ChunkStats:
     """
     1 チャンク分のバイト数・文字数統計を返す。
       raw_bytes     : 受信バイト数（デリミタ込み）
@@ -625,13 +680,14 @@ def chunk_stats(data: bytes, read_mode: ReadMode,
     if read_mode.mode == 'newline':
         term_b = terminator_bytes(data)
         delim_len = len(term_b)
-        terminator_label = check_terminator(data)
+        terminator_label = check_terminator(data, lang=lang)
     elif read_mode.mode == 'delimiter':
         delim_len = len(read_mode.delimiter) if data.endswith(read_mode.delimiter) else 0
-        terminator_label = f"delimiter ({read_mode.delimiter.hex(' ').upper()})"
+        delim_hex = read_mode.delimiter.hex(' ').upper()
+        terminator_label = tr(f"デリミタ ({delim_hex})", f"Delimiter ({delim_hex})", lang=lang)
     else:  # chunk
         delim_len = 0
-        terminator_label = tr(f"固定長 {read_mode.chunk_size} bytes", f"fixed length {read_mode.chunk_size} bytes")
+        terminator_label = tr(f"固定長 {read_mode.chunk_size} bytes", f"fixed length {read_mode.chunk_size} bytes", lang=lang)
 
     payload = data[: len(data) - delim_len]
     # デコードは終端を除いた payload に対して行う。
@@ -641,16 +697,16 @@ def chunk_stats(data: bytes, read_mode: ReadMode,
     char_count = len(decoded) if enc != 'binary' else None
     bpc = (len(payload) / char_count) if char_count is not None and char_count > 0 else None
 
-    return {
-        'raw_bytes'     : len(data),
-        'delim_bytes'   : delim_len,
-        'payload_bytes' : len(payload),
-        'encoding'      : enc,
-        'char_count'    : char_count,
-        'bytes_per_char': round(bpc, 3) if bpc is not None else None,
-        'terminator'    : terminator_label,
-        'decoded'       : decoded,
-    }
+    return ChunkStats(
+        raw_bytes=len(data),
+        delim_bytes=delim_len,
+        payload_bytes=len(payload),
+        encoding=enc,
+        char_count=char_count,
+        bytes_per_char=round(bpc, 3) if bpc is not None else None,
+        terminator=terminator_label,
+        decoded=decoded,
+    )
 
 
 # ==============================
@@ -666,10 +722,10 @@ class ChunkRecord(TypedDict):
 class PortResult:
     port: str
     baudrate: int
-    port_info: Dict = field(default_factory=dict)
+    port_info: Dict[str, Optional[str]] = field(default_factory=dict)
     chunks: List[ChunkRecord] = field(default_factory=list)
     error: Optional[str] = None
-    serial_params: Dict = field(default_factory=dict)
+    serial_params: Dict[str, object] = field(default_factory=dict)
 
 
 def read_one_chunk(
@@ -698,7 +754,7 @@ def read_one_chunk(
 def classify_chunk(data: bytes, read_mode: ReadMode) -> Tuple[bool, str]:
     """受信チャンクが終端まで到達した完全フレームかどうかを返す。"""
     if read_mode.mode == 'newline':
-        complete = any(data.endswith(t) for t, _ in NEWLINE_TERMINATORS)
+        complete = any(data.endswith(t) for t in NEWLINE_TERMINATORS)
         return complete, ('newline_terminator_found' if complete else 'timeout_partial')
 
     if read_mode.mode == 'delimiter':
@@ -716,10 +772,11 @@ def monitor_port(
     wait_sec: int,
     num_chunks: int,
     read_mode: ReadMode,
-    serial_cfg: Dict,
+    serial_cfg: SerialConfig,
     result: PortResult,
-    lock: threading.Lock,
+    log_lock: threading.Lock,
     quiet: bool = False,
+    lang: Language = 'ja',
 ) -> None:
     """スレッド内で 1 ポートを監視し、結果を result に格納する"""
     try:
@@ -727,12 +784,12 @@ def monitor_port(
             port,
             baudrate,
             timeout         = timeout,
-            bytesize        = serial_cfg.get('bytesize', serial.EIGHTBITS),
-            parity          = serial_cfg.get('parity',   serial.PARITY_NONE),
-            stopbits        = serial_cfg.get('stopbits', serial.STOPBITS_ONE),
-            rtscts          = serial_cfg.get('rtscts',   False),
-            xonxoff         = serial_cfg.get('xonxoff',  False),
-            dsrdtr          = serial_cfg.get('dsrdtr',   False),
+            bytesize        = serial_cfg.bytesize,
+            parity          = serial_cfg.parity,
+            stopbits        = serial_cfg.stopbits,
+            rtscts          = serial_cfg.rtscts,
+            xonxoff         = serial_cfg.xonxoff,
+            dsrdtr          = serial_cfg.dsrdtr,
         )
     except serial.SerialException as e:
         result.error = str(e)
@@ -757,8 +814,8 @@ def monitor_port(
                 frame_complete, reason = classify_chunk(chunk, read_mode)
                 collected.append(ChunkRecord(data=chunk, frame_complete=frame_complete, reason=reason))
                 if not quiet:
-                    with lock:
-                        print(tr(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", f"  [{port}@{baudrate}] chunk {len(collected)}: {repr(chunk)}"), file=sys.stderr)
+                    with log_lock:
+                        print(tr(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", f"  [{port}@{baudrate}] chunk {len(collected)}: {repr(chunk)}", lang=lang), file=sys.stderr)
                 if len(collected) >= num_chunks:
                     break
     finally:
@@ -782,36 +839,38 @@ def monitor_port_all_baudrates(
     wait_sec: int,
     num_chunks: int,
     read_mode: ReadMode,
-    serial_cfg: Dict,
-    results: List[PortResult],
-    lock: threading.Lock,
+    serial_cfg: SerialConfig,
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
-) -> None:
+    lang: Language = 'ja',
+    log_lock: Optional[threading.Lock] = None,
+) -> List[PortResult]:
     """1ポートを担当し、指定されたボーレート候補を順に試す。
 
     いずれかのボーレートで受信できても探索は止めず、候補を全件試し切る。
     """
+    per_port_results: List[PortResult] = []
+    effective_lock = log_lock or threading.Lock()
     for baud in baudrates:
         r = PortResult(
             port=port,
             baudrate=baud,
             port_info=get_port_info(port, port_info_map=port_info_map),
             serial_params={
-                'bytesize': serial_cfg.get('bytesize_label', 8),
-                'parity'  : serial_cfg.get('parity_label',   'N'),
-                'stopbits': serial_cfg.get('stopbits_label',  1),
-                'rtscts'  : serial_cfg.get('rtscts',          False),
-                'xonxoff' : serial_cfg.get('xonxoff',         False),
-                'dsrdtr'  : serial_cfg.get('dsrdtr',          False),
+                'bytesize': serial_cfg.bytesize_label,
+                'parity'  : serial_cfg.parity_label,
+                'stopbits': serial_cfg.stopbits_label,
+                'rtscts'  : serial_cfg.rtscts,
+                'xonxoff' : serial_cfg.xonxoff,
+                'dsrdtr'  : serial_cfg.dsrdtr,
             },
         )
         monitor_port(
             port, baud, timeout, wait_sec, num_chunks, read_mode,
-            serial_cfg, r, lock, quiet
+            serial_cfg, r, effective_lock, quiet, lang=lang
         )
-        with lock:
-            results.append(r)
+        per_port_results.append(r)
+    return per_port_results
 
 
 def monitor_all(
@@ -821,9 +880,10 @@ def monitor_all(
     wait_sec: int,
     num_chunks: int,
     read_mode: ReadMode,
-    serial_cfg: Dict,
+    serial_cfg: SerialConfig,
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
+    lang: Language = 'ja',
 ) -> List[PortResult]:
     """
     ポートごとにスレッドを 1 本ずつ起動し、
@@ -831,28 +891,26 @@ def monitor_all(
     quiet=True のときは進捗ログを出さない。
     """
     results: List[PortResult] = []
-    lock = threading.Lock()
-    threads = []
 
     combos = [(p, b) for p in ports for b in baudrates]
     if not quiet:
         print(tr(
             f"\n{len(combos)} 組合せ（{len(ports)} ポート × {len(baudrates)} ボーレート）を監視開始（ポート間は並列、同一ポート内は直列 / 最大 {wait_sec} 秒）…",
             f"\nStarting monitoring for {len(combos)} combinations ({len(ports)} ports × {len(baudrates)} baudrates) (parallel across ports, sequential per port / max {wait_sec} sec)..."
-        ), file=sys.stderr)
+        , lang=lang), file=sys.stderr)
 
-    for port in ports:
-        t = threading.Thread(
-            target=monitor_port_all_baudrates,
-            args=(port, baudrates, timeout, wait_sec, num_chunks, read_mode, serial_cfg,
-                  results, lock, quiet, port_info_map),
-            daemon=True,
-        )
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
+    log_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=max(len(ports), 1)) as executor:
+        futures = [
+            executor.submit(
+                monitor_port_all_baudrates,
+                port, baudrates, timeout, wait_sec, num_chunks, read_mode,
+                serial_cfg, quiet, port_info_map, lang, log_lock
+            )
+            for port in ports
+        ]
+        for future in futures:
+            results.extend(future.result())
 
     return sorted(results, key=lambda r: (r.port, r.baudrate))
 
@@ -860,7 +918,7 @@ def monitor_all(
 # ==============================
 # 表示
 # ==============================
-def print_port_info(info: Dict, stream: Optional[TextIO] = None) -> None:
+def print_port_info(info: Dict, stream: Optional[TextIO] = None, lang: Language = 'ja') -> None:
     """ポート属性情報を表示する"""
     if not info:
         return
@@ -876,21 +934,21 @@ def print_port_info(info: Dict, stream: Optional[TextIO] = None) -> None:
     for label_ja, label_en, key in labels:
         val = info.get(key)
         if val:
-            print(f"    {tr(label_ja, label_en):16}: {val}", file=stream)
+            print(f"    {tr(label_ja, label_en, lang=lang):16}: {val}", file=stream)
 
 
 def print_results(
     results: List[PortResult],
     read_mode: ReadMode,
-    encodings: Sequence[str],
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     no_attr: bool = False,
     quiet: bool = False,
+    lang: Language = 'ja',
 ) -> None:
     """
     人間可読な形式でサマリーを表示する。
     no_attr=True のときはポート属性（VID:PID・メーカー等）を省略する。
     quiet=True のときは通常結果を抑制し、シリアルエラーのみを表示する。
-    encodings はデコード候補リスト。
     """
     active = [r for r in results if r.chunks]
     silent = [r for r in results if not r.chunks and not r.error]
@@ -898,17 +956,18 @@ def print_results(
 
     if quiet:
         if errors:
-            print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]"), file=sys.stderr)
+            print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang), file=sys.stderr)
             for r in errors:
                 print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
         return
 
     print("\n" + "=" * 56, file=sys.stderr)
-    print(tr("  監視結果サマリー", "  Monitoring summary"), file=sys.stderr)
+    print(tr("  監視結果サマリー", "  Monitoring summary", lang=lang), file=sys.stderr)
     print("=" * 56, file=sys.stderr)
 
     for r in active:
-        print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps"), file=sys.stderr)
+        owner_key = id(r)
+        print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps", lang=lang), file=sys.stderr)
         params = r.serial_params
         serial_ja = (
             f"  シリアル  : {params['bytesize']}{params['parity']}{params['stopbits']}"
@@ -922,54 +981,60 @@ def print_results(
             f"  XON/XOFF={'ON' if params['xonxoff'] else 'OFF'}"
             f"  DSR/DTR={'ON' if params.get('dsrdtr') else 'OFF'}"
         )
-        print(tr(serial_ja, serial_en), file=sys.stderr)
+        print(tr(serial_ja, serial_en, lang=lang), file=sys.stderr)
         if not no_attr:
-            print_port_info(r.port_info, stream=sys.stderr)
-        print(tr(f"  受信チャンク数: {len(r.chunks)}", f"  Received chunks: {len(r.chunks)}"), file=sys.stderr)
+            print_port_info(r.port_info, stream=sys.stderr, lang=lang)
+        print(tr(f"  受信チャンク数: {len(r.chunks)}", f"  Received chunks: {len(r.chunks)}", lang=lang), file=sys.stderr)
         print(f"  {'-'*50}", file=sys.stderr)
 
-        per_chunk_stats = [chunk_stats(chunk['data'], read_mode, encodings) for chunk in r.chunks]
-        for i, (chunk_item, stats) in enumerate(zip(r.chunks, per_chunk_stats), start=1):
+        for i, chunk_item in enumerate(r.chunks, start=1):
+            stats = per_chunk_stats[(owner_key, i - 1)]
             data = chunk_item['data']
-            print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---"), file=sys.stderr)
+            print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---", lang=lang), file=sys.stderr)
             print(f"    repr         : {repr(data)}", file=sys.stderr)
             print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
-            print(tr(f"    終端         : {stats['terminator']}", f"    Terminator   : {stats['terminator']}"), file=sys.stderr)
+            print(tr(f"    終端         : {stats.terminator}", f"    Terminator   : {stats.terminator}", lang=lang), file=sys.stderr)
             print(tr(
                 f"    完全フレーム : {'Yes' if chunk_item['frame_complete'] else 'No'}  ({chunk_item['reason']})",
-                f"    Full frame   : {'Yes' if chunk_item['frame_complete'] else 'No'}  ({chunk_item['reason']})"
+                f"    Full frame   : {'Yes' if chunk_item['frame_complete'] else 'No'}  ({chunk_item['reason']})",
+                lang=lang
             ), file=sys.stderr)
             print(tr(
-                f"    受信バイト数 : {stats['raw_bytes']} bytes  （データ {stats['payload_bytes']} + 終端 {stats['delim_bytes']}）",
-                f"    Received     : {stats['raw_bytes']} bytes  (payload {stats['payload_bytes']} + terminator {stats['delim_bytes']})"
+                f"    受信バイト数 : {stats.raw_bytes} bytes  （データ {stats.payload_bytes} + 終端 {stats.delim_bytes}）",
+                f"    Received     : {stats.raw_bytes} bytes  (payload {stats.payload_bytes} + terminator {stats.delim_bytes})",
+                lang=lang
             ), file=sys.stderr)
-            if stats['encoding'] == 'binary':
-                print(tr("    デコード     : 失敗（バイナリデータ）", "    Decode       : failed (binary data)"), file=sys.stderr)
+            if stats.encoding == 'binary':
+                print(tr("    デコード     : 失敗（バイナリデータ）", "    Decode       : failed (binary data)", lang=lang), file=sys.stderr)
             else:
-                print(f"    {stats['encoding'].upper():9}    : {stats['decoded']}", file=sys.stderr)
-                bpc_display = f"{stats['bytes_per_char']:.2f}" if stats['bytes_per_char'] is not None else "-"
+                print(f"    {stats.encoding.upper():9}    : {stats.decoded}", file=sys.stderr)
+                bpc_display = f"{stats.bytes_per_char:.2f}" if stats.bytes_per_char is not None else "-"
                 print(tr(
-                    f"    文字数       : {stats['char_count']} 文字  （平均 {bpc_display} bytes/char）",
-                    f"    Characters   : {stats['char_count']}  (avg {bpc_display} bytes/char)"
+                    f"    文字数       : {stats.char_count} 文字  （平均 {bpc_display} bytes/char）",
+                    f"    Characters   : {stats.char_count}  (avg {bpc_display} bytes/char)",
+                    lang=lang
                 ), file=sys.stderr)
 
         # 複数チャンクの統計
         if len(r.chunks) > 1:
-            payloads = [s['payload_bytes'] for s in per_chunk_stats]
-            chars    = [s['char_count'] for s in per_chunk_stats if s['char_count'] is not None]
-            print(tr(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", f"\n  --- Statistics ({len(r.chunks)} chunks) ---"), file=sys.stderr)
+            chunk_stats_list = [per_chunk_stats[(owner_key, idx)] for idx in range(len(r.chunks))]
+            payloads = [s.payload_bytes for s in chunk_stats_list]
+            chars    = [s.char_count for s in chunk_stats_list if s.char_count is not None]
+            print(tr(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", f"\n  --- Statistics ({len(r.chunks)} chunks) ---", lang=lang), file=sys.stderr)
             print(tr(
                 f"    データバイト数: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
-                f"    Payload bytes: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}"
+                f"    Payload bytes: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
+                lang=lang
             ), file=sys.stderr)
             if chars:
                 print(tr(
                     f"    文字数        : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
-                    f"    Characters   : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}"
+                    f"    Characters   : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
+                    lang=lang
                 ), file=sys.stderr)
 
     if silent:
-        print(tr("\n【データなし（タイムアウト）】", "\n[No data (timeout)]"), file=sys.stderr)
+        print(tr("\n【データなし（タイムアウト）】", "\n[No data (timeout)]", lang=lang), file=sys.stderr)
         for r in silent:
             print(f"  {r.port} @ {r.baudrate} bps", end='', file=sys.stderr)
             if not no_attr and r.port_info.get('description'):
@@ -977,7 +1042,7 @@ def print_results(
             print(file=sys.stderr)
 
     if errors:
-        print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]"), file=sys.stderr)
+        print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang), file=sys.stderr)
         for r in errors:
             print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
 
@@ -990,6 +1055,7 @@ def print_results(
 def build_json(
     results: List[PortResult],
     read_mode: ReadMode,
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats],
     encodings: Sequence[str],
     meta: Optional[Dict] = None,
 ) -> Dict:
@@ -999,21 +1065,22 @@ def build_json(
     """
     entries = []
     for r in results:
+        owner_key = id(r)
         chunks_data = []
-        for chunk_item in r.chunks:
+        for chunk_index, chunk_item in enumerate(r.chunks):
             data = chunk_item['data']
-            stats = chunk_stats(data, read_mode, encodings)
+            stats = per_chunk_stats[(owner_key, chunk_index)]
             chunks_data.append({
                 'repr'          : repr(data),
                 'hex'           : data.hex(' '),
-                'raw_bytes'     : stats['raw_bytes'],
-                'payload_bytes' : stats['payload_bytes'],
-                'delim_bytes'   : stats['delim_bytes'],
-                'terminator'    : stats['terminator'],
-                'encoding'      : stats['encoding'],
-                'decoded'       : stats['decoded'],
-                'char_count'    : stats['char_count'],
-                'bytes_per_char': stats['bytes_per_char'],
+                'raw_bytes'     : stats.raw_bytes,
+                'payload_bytes' : stats.payload_bytes,
+                'delim_bytes'   : stats.delim_bytes,
+                'terminator'    : stats.terminator,
+                'encoding'      : stats.encoding,
+                'decoded'       : stats.decoded,
+                'char_count'    : stats.char_count,
+                'bytes_per_char': stats.bytes_per_char,
                 'frame_complete': chunk_item['frame_complete'],
                 'reason'        : chunk_item['reason'],
             })
@@ -1050,39 +1117,79 @@ def build_json(
 # ==============================
 # メイン
 # ==============================
-def main() -> None:
-    global OUTPUT_LANG
-
-    parser = build_parser()
-    args = parser.parse_args()
-    OUTPUT_LANG = 'en' if should_use_english_console() else 'ja'
-
-    # --- ボーレートのパース ---
+def build_app_config(args: argparse.Namespace, lang: Language) -> AppConfig:
+    """CLI 引数を内部設定オブジェクトに変換する。"""
     try:
         baudrates = parse_baudrates(args.baudrate)
-    except ValueError:
-        print(tr("Error: --baudrate にはカンマ区切りの整数を指定してください (例: 9600,115200)", "Error: --baudrate must be comma-separated integers (e.g. 9600,115200)"), file=sys.stderr)
-        sys.exit(1)
+    except ValueError as exc:
+        raise ConfigError(
+            ja="Error: --baudrate にはカンマ区切りの正の整数を指定してください (例: 9600,115200)",
+            en="Error: --baudrate must be comma-separated positive integers (e.g. 9600,115200)",
+        ) from exc
 
-    # --- 読み取りモードの決定 ---
     try:
-        read_mode = resolve_read_mode(args)
-    except ValueError:
-        print(tr("Error: --delimiter は空でない 16 進数、--chunk は 1 以上の整数を指定してください", "Error: --delimiter must be non-empty hexadecimal, and --chunk must be an integer >= 1"), file=sys.stderr)
-        sys.exit(1)
+        read_mode = resolve_read_mode(args.delimiter, args.chunk, args.newline)
+    except ValueError as exc:
+        raise ConfigError(
+            ja="Error: --delimiter は非空の16進数、--chunk は1以上の整数を指定してください",
+            en="Error: --delimiter must be non-empty hexadecimal and --chunk must be an integer >= 1",
+        ) from exc
 
     if args.lines <= 0:
-        print(tr("Error: --lines は 1 以上の整数を指定してください", "Error: --lines must be an integer >= 1"), file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(
+            ja="Error: --lines は 1 以上の整数を指定してください",
+            en="Error: --lines must be an integer >= 1",
+        )
+    if args.wait < 0:
+        raise ConfigError(
+            ja="Error: --wait は 0 以上の整数を指定してください",
+            en="Error: --wait must be an integer >= 0",
+        )
+    if args.timeout < 0:
+        raise ConfigError(
+            ja="Error: --timeout は 0 以上の数値を指定してください",
+            en="Error: --timeout must be a number >= 0",
+        )
 
-    # --- シリアル設定の組み立て ---
-    serial_cfg = build_serial_config(args)
-
-    # --- エンコーディングのパース ---
+    serial_cfg = build_serial_config(
+        args.bytesize, args.parity, args.stopbits,
+        args.rtscts, args.xonxoff, args.dsrdtr,
+    )
     try:
         encodings = parse_encodings(args.encodings)
-    except ValueError:
-        print(tr("Error: --encodings に有効なエンコーディングを指定してください", "Error: --encodings must contain valid encodings"), file=sys.stderr)
+    except ValueError as exc:
+        raise ConfigError(
+            ja="Error: --encodings に有効なエンコーディングを指定してください",
+            en="Error: --encodings must contain valid encodings",
+        ) from exc
+
+    return AppConfig(
+        requested_ports=list(args.port),
+        baudrates=baudrates,
+        read_mode=read_mode,
+        lines=args.lines,
+        wait_sec=args.wait,
+        timeout_sec=args.timeout,
+        serial_config=serial_cfg,
+        encodings=encodings,
+        json_stdout=args.json,
+        json_file=args.json_file,
+        quiet=args.quiet,
+        no_attr=args.no_attr,
+        lang=lang,
+    )
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    lang: Language = 'en' if should_use_english_console() else 'ja'
+
+    # --- CLI -> AppConfig 変換 ---
+    try:
+        app_cfg = build_app_config(args, lang)
+    except ConfigError as exc:
+        print(tr(exc.ja, exc.en, lang=lang), file=sys.stderr)
         sys.exit(1)
 
     # --- ポート解決 ---
@@ -1093,73 +1200,84 @@ def main() -> None:
     port_info_map = list_port_info_map()
     known_ports = list(port_info_map.keys())
 
-    if args.port:
-        ports = find_ports(args.port, explicit=True, known_ports=known_ports)
+    if app_cfg.requested_ports:
+        ports = find_ports(app_cfg.requested_ports, explicit=True, known_ports=known_ports, lang=app_cfg.lang)
     else:
-        ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports)
+        ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports, lang=app_cfg.lang)
 
     if not ports:
-        print(tr("Error: 利用可能なシリアルポートが見つかりませんでした。", "Error: no available serial ports were found."), file=sys.stderr)
-        print(tr("  接続を確認するか、ポートを引数で直接指定してください。", "  Check the connection or specify ports explicitly as arguments."), file=sys.stderr)
+        print(tr("Error: 利用可能なシリアルポートが見つかりませんでした。", "Error: no available serial ports were found.", lang=app_cfg.lang), file=sys.stderr)
+        print(tr("  接続を確認するか、ポートを引数で直接指定してください。", "  Check the connection or specify ports explicitly as arguments.", lang=app_cfg.lang), file=sys.stderr)
         sys.exit(1)
 
-    if not args.quiet:
+    if not app_cfg.quiet:
         print_startup_summary(
             ports,
-            baudrates,
-            read_mode,
-            encodings,
-            no_attr=args.no_attr,
+            app_cfg.baudrates,
+            app_cfg.read_mode,
+            app_cfg.encodings,
+            no_attr=app_cfg.no_attr,
             port_info_map=port_info_map,
+            lang=app_cfg.lang,
         )
 
     # --- 全ポート×全ボーレート同時監視 ---
     results = monitor_all(
-        ports, baudrates, args.timeout, args.wait,
-        args.lines, read_mode, serial_cfg,
-        quiet=args.quiet,
+        ports, app_cfg.baudrates, app_cfg.timeout_sec, app_cfg.wait_sec,
+        app_cfg.lines, app_cfg.read_mode, app_cfg.serial_config,
+        quiet=app_cfg.quiet,
         port_info_map=port_info_map,
+        lang=app_cfg.lang,
     )
+
+    per_chunk_stats: Dict[Tuple[int, int], ChunkStats] = {}
+    for result in results:
+        owner_key = id(result)
+        for chunk_index, chunk_item in enumerate(result.chunks):
+            per_chunk_stats[(owner_key, chunk_index)] = chunk_stats(
+                chunk_item['data'], app_cfg.read_mode, app_cfg.encodings, lang=app_cfg.lang
+            )
 
     # --- 人間可読な表示 ---
     print_results(
         results,
-        read_mode,
-        encodings=encodings,
-        no_attr=args.no_attr,
-        quiet=args.quiet,
+        app_cfg.read_mode,
+        per_chunk_stats=per_chunk_stats,
+        no_attr=app_cfg.no_attr,
+        quiet=app_cfg.quiet,
+        lang=app_cfg.lang,
     )
 
     # --- JSON 出力 ---
-    if args.json or args.json_file:
+    if app_cfg.json_stdout or app_cfg.json_file:
         # 調査パラメータを metadata として JSON に含める
         json_meta = {
-            'requested_ports'  : args.port if args.port else ['(auto)'],
-            'baudrates'        : baudrates,
-            'wait_sec'         : args.wait,
-            'timeout_sec'      : args.timeout,
-            'num_chunks'       : args.lines,
-            'encodings'        : encodings,
-            'serial_bytesize'  : args.bytesize,
-            'serial_parity'    : args.parity,
-            'serial_stopbits'  : args.stopbits,
-            'serial_rtscts'    : args.rtscts,
-            'serial_xonxoff'   : args.xonxoff,
-            'serial_dsrdtr'    : args.dsrdtr,
+            'requested_ports'  : app_cfg.requested_ports if app_cfg.requested_ports else ['(auto)'],
+            'baudrates'        : app_cfg.baudrates,
+            'wait_sec'         : app_cfg.wait_sec,
+            'timeout_sec'      : app_cfg.timeout_sec,
+            'num_chunks'       : app_cfg.lines,
+            'encodings'        : app_cfg.encodings,
+            'serial_bytesize'  : app_cfg.serial_config.bytesize_label,
+            'serial_parity'    : app_cfg.serial_config.parity_label,
+            'serial_stopbits'  : app_cfg.serial_config.stopbits_label,
+            'serial_rtscts'    : app_cfg.serial_config.rtscts,
+            'serial_xonxoff'   : app_cfg.serial_config.xonxoff,
+            'serial_dsrdtr'    : app_cfg.serial_config.dsrdtr,
         }
-        payload = build_json(results, read_mode, encodings=encodings, meta=json_meta)
-        if args.json:
+        payload = build_json(results, app_cfg.read_mode, per_chunk_stats=per_chunk_stats, encodings=app_cfg.encodings, meta=json_meta)
+        if app_cfg.json_stdout:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
-        if args.json_file:
-            with open(args.json_file, 'w', encoding='utf-8') as f:
+        if app_cfg.json_file:
+            with open(app_cfg.json_file, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            if not args.quiet:
-                print(tr(f"\nJSON を保存しました: {args.json_file}", f"\nSaved JSON: {args.json_file}"), file=sys.stderr)
+            if not app_cfg.quiet:
+                print(tr(f"\nJSON を保存しました: {app_cfg.json_file}", f"\nSaved JSON: {app_cfg.json_file}", lang=app_cfg.lang), file=sys.stderr)
 
     # アクティブなポートがなければ終了コード 1
     if not any(r.chunks for r in results):
-        if not args.quiet:
-            print(tr(f"\n{args.wait} 秒待機しましたが、どの組み合わせでもデータを受信できませんでした。", f"\nWaited {args.wait} seconds, but no data was received for any combination."), file=sys.stderr)
+        if not app_cfg.quiet:
+            print(tr(f"\n{app_cfg.wait_sec} 秒待機しましたが、どの組み合わせでもデータを受信できませんでした。", f"\nWaited {app_cfg.wait_sec} seconds, but no data was received for any combination.", lang=app_cfg.lang), file=sys.stderr)
         sys.exit(1)
 
 
