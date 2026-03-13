@@ -111,7 +111,6 @@ import glob
 import json
 import argparse
 import threading
-import locale
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Literal, Optional, Sequence, TextIO, Tuple, TypedDict
@@ -169,22 +168,24 @@ def tr(ja: str, en: str) -> str:
     return ja if OUTPUT_LANG == 'ja' else en
 
 
-def should_use_english_console(stream: Optional[TextIO] = None) -> bool:
-    """Linux のプレーンコンソールでは英語表示へフォールバックする。"""
-    if not sys.platform.startswith('linux'):
+def should_use_english_console() -> bool:
+    """Linux ローカルのプレーンコンソール（TERM=linux）では英語表示に切り替える。"""
+    force_lang = os.environ.get('SERIA_FORCE_LANG', '').lower()
+    if force_lang in {'ja', 'jp'}:
         return False
-
-    if os.environ.get('SERIA_FORCE_LANG', '').lower() in {'ja', 'jp'}:
-        return False
-    if os.environ.get('SERIA_FORCE_LANG', '').lower() in {'en', 'english'}:
+    if force_lang in {'en', 'english'}:
         return True
 
-    if os.environ.get('TERM') != 'linux':
+    # 要件:
+    # - Windows は日本語
+    # - SSH 接続先ターミナルは日本語
+    # - X Window 上のターミナルは日本語
+    # - Linux ローカルのプレーンコンソールのみ英語
+    if not sys.platform.startswith('linux'):
         return False
-
-    target = stream or sys.stderr
-    encoding = (getattr(target, 'encoding', None) or locale.getpreferredencoding(False) or '').lower()
-    return 'utf-8' not in encoding and 'utf8' not in encoding
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
+        return False
+    return os.environ.get('TERM') == 'linux'
 # DSR/DTR フロー制御は bool フラグで serial.Serial に渡すため定数マップは不要
 
 
@@ -1054,7 +1055,7 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args()
-    OUTPUT_LANG = 'en' if should_use_english_console(sys.stderr) else 'ja'
+    OUTPUT_LANG = 'en' if should_use_english_console() else 'ja'
 
     # --- ボーレートのパース ---
     try:
