@@ -64,10 +64,10 @@
 #   --dsrdtr                DSR/DTR ハードウェアフロー制御を有効にする
 #
 # デコード
-#   --encodings utf-8,cp932,ascii
+#   --encodings shift_jis,utf-8,cp932,ascii
 #                           試みるエンコーディングをカンマ区切りで指定
-#                             デフォルト: utf-8,shift_jis
-#                             例: python seria.py --encodings utf-8,cp932,ascii
+#                             デフォルト: shift_jis,utf-8
+#                             例: python seria.py --encodings shift_jis,utf-8,cp932,ascii
 #
 # 出力形式
 #   --json                  結果を JSON 形式で標準出力に出す（障害記録用）
@@ -135,7 +135,7 @@ DEFAULT_PORT_PATTERNS = [
 DEFAULT_BAUDRATE   = 9600
 DEFAULT_TIMEOUT    = 0.1
 DEFAULT_WAIT_SEC   = 10
-DEFAULT_ENCODINGS: Tuple[str, ...] = ('utf-8', 'shift_jis')  # --encodings のデフォルト値
+DEFAULT_ENCODINGS: Tuple[str, ...] = ('shift_jis', 'utf-8')  # --encodings のデフォルト値
 NEWLINE_TERMINATORS: Sequence[bytes] = (b'\r\n', b'\r', b'\n')
 
 # pyserial の定数マッピング（引数文字列 → serial モジュール定数）
@@ -674,7 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='ENC,...',
         help="試みるエンコーディングをカンマ区切りで指定\n"
              f"デフォルト: {','.join(DEFAULT_ENCODINGS)}\n"
-             "例: --encodings utf-8,cp932,ascii"
+             "例: --encodings shift_jis,utf-8,cp932,ascii"
     )
 
     # --- 出力形式 ---
