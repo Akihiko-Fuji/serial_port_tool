@@ -73,8 +73,8 @@
 #   --json                  結果を JSON 形式で標準出力に出す（障害記録用）
 #   --json-file <path>      JSON をファイルに保存する
 #                             例: python seria.py --json-file result.json
-#   --quiet                 進捗ログ（チャンク受信通知・起動メッセージ）を抑制する
-#                             リダイレクト先のログをきれいに保ちたい場合に使う
+#   --quiet                 通常表示を抑制し、シリアルエラーのみ表示する
+#                             JSON 保存や監視バッチ向け（異常時のみ stderr に出力）
 #   --no-attr               ポート属性（VID:PID・メーカー等）の表示を省略する
 #
 # ----------------------------------------------------------------------------
@@ -113,7 +113,7 @@ import argparse
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, TextIO, Tuple, TypedDict
+from typing import Dict, List, Literal, Optional, Sequence, TextIO, Tuple, TypedDict
 
 # ==============================
 # デフォルト設定
@@ -173,7 +173,7 @@ class ReadMode:
       delimiter : mode='delimiter' のときの終端バイト列
       chunk_size: mode='chunk' のときのバイト数
     """
-    mode: str = 'newline'
+    mode: Literal['newline', 'delimiter', 'chunk'] = 'newline'
     delimiter: bytes = b''
     chunk_size: int = 0
     selected_by_user: bool = False
@@ -191,19 +191,27 @@ class LineBufferedReader:
                     return self._consume(len(self.pending))
                 return b''
 
+            trailing_cr = False
             for idx, value in enumerate(self.pending):
                 if value == 0x0A:  # LF
                     return self._consume(idx + 1)
                 if value == 0x0D:  # CR
                     if idx + 1 < len(self.pending) and self.pending[idx + 1] == 0x0A:
                         return self._consume(idx + 2)
-                    return self._consume(idx + 1)
+                    if idx + 1 < len(self.pending):
+                        return self._consume(idx + 1)
+                    # CR が末尾で止まっている場合は次バイト到着まで待機し、
+                    # 分割到着した CRLF を CR/LF に分離しないようにする。
+                    trailing_cr = True
+                    break
 
             in_waiting = getattr(ser, 'in_waiting', 0)
             read_size = in_waiting if in_waiting > 0 else 1
             chunk = ser.read(read_size)
             if not chunk:
                 if self.pending:
+                    if trailing_cr and deadline is not None and time.monotonic() < deadline:
+                        continue
                     return self._consume(len(self.pending))
                 return b''
             self.pending.extend(chunk)
@@ -356,6 +364,7 @@ def looks_like_text(decoded: str) -> bool:
     total = len(decoded)
     printable_ratio = printable_count / total
     control_ratio = control_count / total
+    # 可視文字 95% 以上かつ制御文字 5% 以下をテキストとみなす経験則。
     return printable_ratio >= 0.95 and control_ratio <= 0.05
 
 def parse_baudrates(raw: str) -> List[int]:
@@ -528,7 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--quiet', action='store_true',
-        help="標準出力/標準エラーの通常表示を抑制する（エラーのみ出力）"
+        help="通常表示を抑制し、シリアルエラーのみ標準エラーに出力する"
     )
     parser.add_argument(
         '--no-attr', action='store_true',
@@ -645,8 +654,11 @@ def read_one_chunk(
     if read_mode.mode == 'newline':
         return line_reader.read_line(ser, deadline=deadline)
     elif read_mode.mode == 'delimiter':
+        # read_until() は serial timeout 単位で復帰し、monitor_port() の
+        # ループ先頭 deadline 判定で停止する（最大 timeout 秒の超過）。
         return ser.read_until(expected=read_mode.delimiter)
     else:
+        # 固定長 read() も同様に timeout 単位で復帰する設計。
         return ser.read(read_mode.chunk_size)
 
 
@@ -710,11 +722,7 @@ def monitor_port(
                 break
             if chunk:
                 frame_complete, reason = classify_chunk(chunk, read_mode)
-                collected.append({
-                    'data': chunk,
-                    'frame_complete': frame_complete,
-                    'reason': reason,
-                })
+                collected.append(ChunkRecord(data=chunk, frame_complete=frame_complete, reason=reason))
                 if not quiet:
                     with lock:
                         print(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", file=sys.stderr)
@@ -839,17 +847,25 @@ def print_port_info(info: Dict, stream: Optional[TextIO] = None) -> None:
 def print_results(
     results: List[PortResult],
     read_mode: ReadMode,
-    encodings: Optional[List[str]] = None,
+    encodings: Sequence[str],
     no_attr: bool = False,
+    errors_only: bool = False,
 ) -> None:
     """
     人間可読な形式でサマリーを表示する。
     no_attr=True のときはポート属性（VID:PID・メーカー等）を省略する。
-    encodings はデコード候補リスト（省略時は DEFAULT_ENCODINGS）。
+    encodings はデコード候補リスト。
     """
     active = [r for r in results if r.chunks]
     silent = [r for r in results if not r.chunks and not r.error]
     errors = [r for r in results if r.error]
+
+    if errors_only:
+        if errors:
+            print("\n【シリアルエラー（オープン/読み取り/クローズ）】", file=sys.stderr)
+            for r in errors:
+                print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
+        return
 
     print("\n" + "=" * 56, file=sys.stderr)
     print("  監視結果サマリー", file=sys.stderr)
@@ -919,7 +935,7 @@ def print_results(
 def build_json(
     results: List[PortResult],
     read_mode: ReadMode,
-    encodings: Optional[List[str]] = None,
+    encodings: Sequence[str],
     meta: Optional[Dict] = None,
 ) -> Dict:
     """
@@ -964,7 +980,7 @@ def build_json(
         'delimiter_hex'  : read_mode.delimiter.hex(' ').upper() if read_mode.delimiter else None,
         'chunk_size'     : read_mode.chunk_size if read_mode.mode == 'chunk' else None,
         'mode_selected_by_user': read_mode.selected_by_user,
-        'encodings'      : encodings or DEFAULT_ENCODINGS,
+        'encodings'      : list(encodings),
     }
     if meta:
         metadata.update(meta)
@@ -1047,8 +1063,13 @@ def main() -> None:
     )
 
     # --- 人間可読な表示 ---
-    if not args.quiet:
-        print_results(results, read_mode, encodings=encodings, no_attr=args.no_attr)
+    print_results(
+        results,
+        read_mode,
+        encodings=encodings,
+        no_attr=args.no_attr,
+        errors_only=args.quiet,
+    )
 
     # --- JSON 出力 ---
     if args.json or args.json_file:
