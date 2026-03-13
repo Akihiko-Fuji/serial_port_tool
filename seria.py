@@ -230,6 +230,20 @@ class ChunkStats:
     decoded: str
 
 
+class FrameReason(str, Enum):
+    NEWLINE_FOUND = 'newline_terminator_found'
+    DELIMITER_FOUND = 'delimiter_found'
+    FIXED_SIZE_COMPLETE = 'fixed_size_complete'
+    TIMEOUT_PARTIAL = 'timeout_partial'
+
+
+@dataclass(frozen=True)
+class ChunkRecord:
+    data: bytes
+    frame_complete: bool
+    reason: FrameReason
+
+
 @dataclass(frozen=True)
 class PortInfo:
     vid_pid: Optional[str] = None
@@ -764,23 +778,6 @@ def chunk_stats(
     )
 
 
-# ==============================
-# 単一ポート監視（スレッド用）
-# ==============================
-class FrameReason(str, Enum):
-    NEWLINE_FOUND = 'newline_terminator_found'
-    DELIMITER_FOUND = 'delimiter_found'
-    FIXED_SIZE_COMPLETE = 'fixed_size_complete'
-    TIMEOUT_PARTIAL = 'timeout_partial'
-
-
-@dataclass(frozen=True)
-class ChunkRecord:
-    data: bytes
-    frame_complete: bool
-    reason: FrameReason
-
-
 @dataclass
 class PortResult:
     port: str
@@ -982,12 +979,6 @@ def monitor_port_all_baudrates(
     return per_port_results
 
 
-def finalize_result(result: PortResult, read_mode: ReadMode, encodings: Sequence[str], lang: Language) -> PortResult:
-    """PortResult にチャンク統計を付与し、表示/JSON 出力可能な完成状態にする。"""
-    result.attach_stats(read_mode, encodings, lang=lang)
-    return result
-
-
 def monitor_all(
     ports: List[str],
     baudrates: List[int],
@@ -1028,8 +1019,9 @@ def monitor_all(
         for future in futures:
             results.extend(future.result())
 
-    finalized = [finalize_result(r, read_mode, encodings, lang=lang) for r in results]
-    return sorted(finalized, key=lambda r: (r.port, r.baudrate))
+    for result in results:
+        result.attach_stats(read_mode, encodings, lang=lang)
+    return sorted(results, key=lambda r: (r.port, r.baudrate))
 
 
 # ==============================
