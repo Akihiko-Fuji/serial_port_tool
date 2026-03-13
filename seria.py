@@ -111,10 +111,11 @@ import glob
 import json
 import argparse
 import threading
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Literal, Optional, Sequence, TextIO, Tuple, TypedDict
+from typing import Dict, List, Literal, Optional, Sequence, TextIO, Tuple
 
 # ==============================
 # デフォルト設定
@@ -230,6 +231,46 @@ class ChunkStats:
 
 
 @dataclass(frozen=True)
+class PortInfo:
+    vid_pid: Optional[str] = None
+    manufacturer: Optional[str] = None
+    product: Optional[str] = None
+    serial_number: Optional[str] = None
+    description: Optional[str] = None
+    interface: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Optional[str]]:
+        return {
+            'vid_pid': self.vid_pid,
+            'manufacturer': self.manufacturer,
+            'product': self.product,
+            'serial_number': self.serial_number,
+            'description': self.description,
+            'interface': self.interface,
+        }
+
+
+@dataclass(frozen=True)
+class SerialParams:
+    bytesize: int
+    parity: str
+    stopbits: float
+    rtscts: bool
+    xonxoff: bool
+    dsrdtr: bool
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            'bytesize': self.bytesize,
+            'parity': self.parity,
+            'stopbits': self.stopbits,
+            'rtscts': self.rtscts,
+            'xonxoff': self.xonxoff,
+            'dsrdtr': self.dsrdtr,
+        }
+
+
+@dataclass(frozen=True)
 class AppConfig:
     requested_ports: List[str]
     baudrates: List[int]
@@ -297,6 +338,12 @@ class LineBufferedReader:
         return data
 
 
+@dataclass(frozen=True)
+class PortDiscoveryResult:
+    ports: List[str]
+    warnings: List[str] = field(default_factory=list)
+
+
 # ==============================
 # ポート探索
 # ==============================
@@ -310,7 +357,7 @@ def find_ports(
     explicit: bool = False,
     known_ports: Optional[Sequence[str]] = None,
     lang: Language = 'ja',
-) -> List[str]:
+) -> PortDiscoveryResult:
     """
     実在するシリアルポートを返す（重複なし・ソート済み）。
 
@@ -327,6 +374,7 @@ def find_ports(
          comports() で存在確認だけ行い、一致したポートのみ追加する。
     """
     found = set()
+    warnings: List[str] = []
     known_port_set = set(known_ports) if known_ports is not None else set(list_port_info_map().keys())
 
     for pattern in (patterns or []):
@@ -343,16 +391,16 @@ def find_ports(
             if pattern in known_port_set:
                 found.add(pattern)
             else:
-                print(tr(f"Warning: 指定ポートが見つかりません: {pattern}", f"Warning: specified port not found: {pattern}", lang=lang), file=sys.stderr)
+                warnings.append(tr(f"Warning: 指定ポートが見つかりません: {pattern}", f"Warning: specified port not found: {pattern}", lang=lang))
 
     if not explicit:
         # 自動検索モードのみ全ポートを comports() で補完
         found.update(known_port_set)
 
-    return sorted(found)
+    return PortDiscoveryResult(ports=sorted(found), warnings=warnings)
 
 
-def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None) -> Dict:
+def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None) -> PortInfo:
     """
     pyserial の list_ports からポートの属性情報を取得して返す。
     VID:PID、メーカー、製品名、シリアル番号、説明など。
@@ -362,15 +410,15 @@ def get_port_info(port: str, port_info_map: Optional[Dict[str, serial.tools.list
     if info:
         vid = info.vid
         pid = info.pid
-        return {
-            'vid_pid'     : f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else None,
-            'manufacturer': info.manufacturer,
-            'product'     : info.product,
-            'serial_number': info.serial_number,
-            'description' : info.description,
-            'interface'   : info.interface,
-        }
-    return {}
+        return PortInfo(
+            vid_pid=f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else None,
+            manufacturer=info.manufacturer,
+            product=info.product,
+            serial_number=info.serial_number,
+            description=info.description,
+            interface=info.interface,
+        )
+    return PortInfo()
 
 
 # ==============================
@@ -713,21 +761,75 @@ def chunk_stats(
 # ==============================
 # 単一ポート監視（スレッド用）
 # ==============================
-class ChunkRecord(TypedDict):
+class FrameReason(str, Enum):
+    NEWLINE_FOUND = 'newline_terminator_found'
+    DELIMITER_FOUND = 'delimiter_found'
+    FIXED_SIZE_COMPLETE = 'fixed_size_complete'
+    TIMEOUT_PARTIAL = 'timeout_partial'
+
+
+@dataclass(frozen=True)
+class ChunkRecord:
     data: bytes
     frame_complete: bool
-    reason: str
+    reason: FrameReason
 
 
 @dataclass
 class PortResult:
     port: str
     baudrate: int
-    port_info: Dict[str, Optional[str]] = field(default_factory=dict)
+    serial_params: SerialParams
+    port_info: PortInfo = field(default_factory=PortInfo)
     chunks: List[ChunkRecord] = field(default_factory=list)
     chunk_stats_list: List[ChunkStats] = field(default_factory=list)
     error: Optional[str] = None
-    serial_params: Dict[str, object] = field(default_factory=dict)
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.chunks)
+
+    @property
+    def has_error(self) -> bool:
+        return bool(self.error)
+
+    def attach_stats(self, read_mode: ReadMode, encodings: Sequence[str], lang: Language) -> None:
+        self.chunk_stats_list = [
+            chunk_stats(chunk.data, read_mode, encodings, lang=lang)
+            for chunk in self.chunks
+        ]
+
+    def to_json_dict(self) -> Dict[str, object]:
+        chunks_data = []
+        for chunk_index, chunk in enumerate(self.chunks):
+            stats = self.chunk_stats_list[chunk_index]
+            data = chunk.data
+            chunks_data.append({
+                'repr': repr(data),
+                'hex': data.hex(' '),
+                'raw_bytes': stats.raw_bytes,
+                'payload_bytes': stats.payload_bytes,
+                'delim_bytes': stats.delim_bytes,
+                'terminator': stats.terminator,
+                'encoding': stats.encoding,
+                'decoded': stats.decoded,
+                'char_count': stats.char_count,
+                'bytes_per_char': stats.bytes_per_char,
+                'frame_complete': chunk.frame_complete,
+                'reason': chunk.reason.value,
+            })
+
+        return {
+            'port': self.port,
+            'baudrate': self.baudrate,
+            'serial_params': self.serial_params.to_dict(),
+            'port_info': self.port_info.to_dict(),
+            'has_data': self.has_data,
+            'has_error': self.has_error,
+            'error': self.error,
+            'chunk_count': len(self.chunks),
+            'chunks': chunks_data,
+        }
 
 
 def read_one_chunk(
@@ -753,18 +855,18 @@ def read_one_chunk(
         return ser.read(read_mode.chunk_size)
 
 
-def classify_chunk(data: bytes, read_mode: ReadMode) -> Tuple[bool, str]:
+def classify_chunk(data: bytes, read_mode: ReadMode) -> Tuple[bool, FrameReason]:
     """受信チャンクが終端まで到達した完全フレームかどうかを返す。"""
     if read_mode.mode == 'newline':
         complete = any(data.endswith(t) for t in NEWLINE_TERMINATORS)
-        return complete, ('newline_terminator_found' if complete else 'timeout_partial')
+        return complete, (FrameReason.NEWLINE_FOUND if complete else FrameReason.TIMEOUT_PARTIAL)
 
     if read_mode.mode == 'delimiter':
         complete = data.endswith(read_mode.delimiter)
-        return complete, ('delimiter_found' if complete else 'timeout_partial')
+        return complete, (FrameReason.DELIMITER_FOUND if complete else FrameReason.TIMEOUT_PARTIAL)
 
     complete = len(data) == read_mode.chunk_size
-    return complete, ('fixed_size_complete' if complete else 'timeout_partial')
+    return complete, (FrameReason.FIXED_SIZE_COMPLETE if complete else FrameReason.TIMEOUT_PARTIAL)
 
 
 def monitor_port(
@@ -857,14 +959,14 @@ def monitor_port_all_baudrates(
             port=port,
             baudrate=baud,
             port_info=get_port_info(port, port_info_map=port_info_map),
-            serial_params={
-                'bytesize': serial_cfg.bytesize_label,
-                'parity'  : serial_cfg.parity_label,
-                'stopbits': serial_cfg.stopbits_label,
-                'rtscts'  : serial_cfg.rtscts,
-                'xonxoff' : serial_cfg.xonxoff,
-                'dsrdtr'  : serial_cfg.dsrdtr,
-            },
+            serial_params=SerialParams(
+                bytesize=serial_cfg.bytesize_label,
+                parity=serial_cfg.parity_label,
+                stopbits=serial_cfg.stopbits_label,
+                rtscts=serial_cfg.rtscts,
+                xonxoff=serial_cfg.xonxoff,
+                dsrdtr=serial_cfg.dsrdtr,
+            ),
         )
         monitor_port(
             port, baud, timeout, wait_sec, num_chunks, read_mode,
@@ -872,6 +974,12 @@ def monitor_port_all_baudrates(
         )
         per_port_results.append(r)
     return per_port_results
+
+
+def finalize_result(result: PortResult, read_mode: ReadMode, encodings: Sequence[str], lang: Language) -> PortResult:
+    """PortResult にチャンク統計を付与し、表示/JSON 出力可能な完成状態にする。"""
+    result.attach_stats(read_mode, encodings, lang=lang)
+    return result
 
 
 def monitor_all(
@@ -882,6 +990,7 @@ def monitor_all(
     num_chunks: int,
     read_mode: ReadMode,
     serial_cfg: SerialConfig,
+    encodings: Sequence[str],
     quiet: bool = False,
     port_info_map: Optional[Dict[str, serial.tools.list_ports_common.ListPortInfo]] = None,
     lang: Language = 'ja',
@@ -913,16 +1022,15 @@ def monitor_all(
         for future in futures:
             results.extend(future.result())
 
-    return sorted(results, key=lambda r: (r.port, r.baudrate))
+    finalized = [finalize_result(r, read_mode, encodings, lang=lang) for r in results]
+    return sorted(finalized, key=lambda r: (r.port, r.baudrate))
 
 
 # ==============================
 # 表示
 # ==============================
-def print_port_info(info: Dict, stream: Optional[TextIO] = None, lang: Language = 'ja') -> None:
+def print_port_info(info: PortInfo, stream: Optional[TextIO] = None, lang: Language = 'ja') -> None:
     """ポート属性情報を表示する"""
-    if not info:
-        return
     stream = stream or sys.stderr
     labels = [
         ('VID:PID', 'VID:PID', 'vid_pid'),
@@ -933,9 +1041,13 @@ def print_port_info(info: Dict, stream: Optional[TextIO] = None, lang: Language 
         ('インターフェース', 'Interface', 'interface'),
     ]
     for label_ja, label_en, key in labels:
-        val = info.get(key)
+        val = getattr(info, key)
         if val:
             print(f"    {tr(label_ja, label_en, lang=lang):16}: {val}", file=stream)
+
+
+def msg_serial_errors(lang: Language) -> str:
+    return tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang)
 
 
 def print_results(
@@ -950,13 +1062,13 @@ def print_results(
     no_attr=True のときはポート属性（VID:PID・メーカー等）を省略する。
     quiet=True のときは通常結果を抑制し、シリアルエラーのみを表示する。
     """
-    active = [r for r in results if r.chunks]
-    silent = [r for r in results if not r.chunks and not r.error]
-    errors = [r for r in results if r.error]
+    active = [r for r in results if r.has_data]
+    silent = [r for r in results if not r.has_data and not r.has_error]
+    errors = [r for r in results if r.has_error]
 
     if quiet:
         if errors:
-            print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang), file=sys.stderr)
+            print(msg_serial_errors(lang), file=sys.stderr)
             for r in errors:
                 print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
         return
@@ -969,16 +1081,16 @@ def print_results(
         print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps", lang=lang), file=sys.stderr)
         params = r.serial_params
         serial_ja = (
-            f"  シリアル  : {params['bytesize']}{params['parity']}{params['stopbits']}"
-            f"  RTS/CTS={'ON' if params['rtscts'] else 'OFF'}"
-            f"  XON/XOFF={'ON' if params['xonxoff'] else 'OFF'}"
-            f"  DSR/DTR={'ON' if params.get('dsrdtr') else 'OFF'}"
+            f"  シリアル  : {params.bytesize}{params.parity}{params.stopbits}"
+            f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
+            f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
+            f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
         )
         serial_en = (
-            f"  Serial    : {params['bytesize']}{params['parity']}{params['stopbits']}"
-            f"  RTS/CTS={'ON' if params['rtscts'] else 'OFF'}"
-            f"  XON/XOFF={'ON' if params['xonxoff'] else 'OFF'}"
-            f"  DSR/DTR={'ON' if params.get('dsrdtr') else 'OFF'}"
+            f"  Serial    : {params.bytesize}{params.parity}{params.stopbits}"
+            f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
+            f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
+            f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
         )
         print(tr(serial_ja, serial_en, lang=lang), file=sys.stderr)
         if not no_attr:
@@ -988,14 +1100,14 @@ def print_results(
 
         for i, chunk_item in enumerate(r.chunks, start=1):
             stats = r.chunk_stats_list[i - 1]
-            data = chunk_item['data']
+            data = chunk_item.data
             print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---", lang=lang), file=sys.stderr)
             print(f"    repr         : {repr(data)}", file=sys.stderr)
             print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
             print(tr(f"    終端         : {stats.terminator}", f"    Terminator   : {stats.terminator}", lang=lang), file=sys.stderr)
             print(tr(
-                f"    完全フレーム : {'Yes' if chunk_item['frame_complete'] else 'No'}  ({chunk_item['reason']})",
-                f"    Full frame   : {'Yes' if chunk_item['frame_complete'] else 'No'}  ({chunk_item['reason']})",
+                f"    完全フレーム : {'Yes' if chunk_item.frame_complete else 'No'}  ({chunk_item.reason.value})",
+                f"    Full frame   : {'Yes' if chunk_item.frame_complete else 'No'}  ({chunk_item.reason.value})",
                 lang=lang
             ), file=sys.stderr)
             print(tr(
@@ -1036,12 +1148,12 @@ def print_results(
         print(tr("\n【データなし（タイムアウト）】", "\n[No data (timeout)]", lang=lang), file=sys.stderr)
         for r in silent:
             print(f"  {r.port} @ {r.baudrate} bps", end='', file=sys.stderr)
-            if not no_attr and r.port_info.get('description'):
-                print(f"  ({r.port_info['description']})", end='', file=sys.stderr)
+            if not no_attr and r.port_info.description:
+                print(f"  ({r.port_info.description})", end='', file=sys.stderr)
             print(file=sys.stderr)
 
     if errors:
-        print(tr("\n【シリアルエラー（オープン/読み取り/クローズ）】", "\n[Serial errors (open/read/close)]", lang=lang), file=sys.stderr)
+        print(msg_serial_errors(lang), file=sys.stderr)
         for r in errors:
             print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
 
@@ -1061,37 +1173,8 @@ def build_json(
     結果を JSON シリアライズ可能な dict に変換する。
     meta には調査パラメータ（wait / timeout / delimiter / requested_ports / baudrates 等）を渡す。
     """
-    entries = []
-    for r in results:
-        chunks_data = []
-        for chunk_index, chunk_item in enumerate(r.chunks):
-            data = chunk_item['data']
-            stats = r.chunk_stats_list[chunk_index]
-            chunks_data.append({
-                'repr'          : repr(data),
-                'hex'           : data.hex(' '),
-                'raw_bytes'     : stats.raw_bytes,
-                'payload_bytes' : stats.payload_bytes,
-                'delim_bytes'   : stats.delim_bytes,
-                'terminator'    : stats.terminator,
-                'encoding'      : stats.encoding,
-                'decoded'       : stats.decoded,
-                'char_count'    : stats.char_count,
-                'bytes_per_char': stats.bytes_per_char,
-                'frame_complete': chunk_item['frame_complete'],
-                'reason'        : chunk_item['reason'],
-            })
-        entries.append({
-            'port'         : r.port,
-            'baudrate'     : r.baudrate,
-            'serial_params': r.serial_params,
-            'port_info'    : r.port_info,
-            'has_data'     : bool(r.chunks),
-            'has_error'    : bool(r.error),
-            'error'        : r.error,
-            'chunk_count'  : len(r.chunks),
-            'chunks'       : chunks_data,
-        })
+    entries = [r.to_json_dict() for r in results]
+
 
     # metadata: 調査パラメータをまとめて調査ログとして完結させる
     metadata = {
@@ -1198,9 +1281,13 @@ def main() -> None:
     known_ports = list(port_info_map.keys())
 
     if app_cfg.requested_ports:
-        ports = find_ports(app_cfg.requested_ports, explicit=True, known_ports=known_ports, lang=app_cfg.lang)
+        discovery = find_ports(app_cfg.requested_ports, explicit=True, known_ports=known_ports, lang=app_cfg.lang)
     else:
-        ports = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports, lang=app_cfg.lang)
+        discovery = find_ports(DEFAULT_PORT_PATTERNS, explicit=False, known_ports=known_ports, lang=app_cfg.lang)
+    ports = discovery.ports
+
+    for warning in discovery.warnings:
+        print(warning, file=sys.stderr)
 
     if not ports:
         print(tr("Error: 利用可能なシリアルポートが見つかりませんでした。", "Error: no available serial ports were found.", lang=app_cfg.lang), file=sys.stderr)
@@ -1221,17 +1308,11 @@ def main() -> None:
     # --- 全ポート×全ボーレート同時監視 ---
     results = monitor_all(
         ports, app_cfg.baudrates, app_cfg.timeout_sec, app_cfg.wait_sec,
-        app_cfg.lines, app_cfg.read_mode, app_cfg.serial_config,
+        app_cfg.lines, app_cfg.read_mode, app_cfg.serial_config, app_cfg.encodings,
         quiet=app_cfg.quiet,
         port_info_map=port_info_map,
         lang=app_cfg.lang,
     )
-
-    for result in results:
-        result.chunk_stats_list = [
-            chunk_stats(chunk_item['data'], app_cfg.read_mode, app_cfg.encodings, lang=app_cfg.lang)
-            for chunk_item in result.chunks
-        ]
 
     # --- 人間可読な表示 ---
     print_results(
@@ -1269,7 +1350,7 @@ def main() -> None:
                 print(tr(f"\nJSON を保存しました: {app_cfg.json_file}", f"\nSaved JSON: {app_cfg.json_file}", lang=app_cfg.lang), file=sys.stderr)
 
     # アクティブなポートがなければ終了コード 1
-    if not any(r.chunks for r in results):
+    if not any(r.has_data for r in results):
         if not app_cfg.quiet:
             print(tr(f"\n{app_cfg.wait_sec} 秒待機しましたが、どの組み合わせでもデータを受信できませんでした。", f"\nWaited {app_cfg.wait_sec} seconds, but no data was received for any combination.", lang=app_cfg.lang), file=sys.stderr)
         sys.exit(1)
