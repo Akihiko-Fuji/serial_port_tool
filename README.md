@@ -75,7 +75,7 @@ python seria.py COM3 COM5 /dev/rfcomm0
 
 ## 5. オプション詳細
 
-## 5.1 ポート / ボーレート
+### 5.1 ポート / ボーレート
 
 - `port`（位置引数、複数可）
   - ポート名またはワイルドカード
@@ -85,7 +85,7 @@ python seria.py COM3 COM5 /dev/rfcomm0
   - カンマ区切りで複数指定可
   - 既定: `9600`
 
-## 5.2 読み取りモード（排他指定）
+### 5.2 読み取りモード（排他指定）
 
 次の3つから1つを選択します（既定は改行終端モード）。
 
@@ -100,7 +100,7 @@ python seria.py COM3 COM5 /dev/rfcomm0
    - `read(N)` を使用
    - 固定長 N バイト読み取り
 
-## 5.3 受信制御
+### 5.3 受信制御
 
 - `-n`, `--lines <数>`
   - 取得するチャンク数（既定: `1`）
@@ -109,7 +109,7 @@ python seria.py COM3 COM5 /dev/rfcomm0
 - `-t`, `--timeout <秒>`
   - シリアル `read()` タイムアウト（既定: `0.1`）
 
-## 5.4 シリアルパラメータ
+### 5.4 シリアルパラメータ
 
 - `--bytesize 5|6|7|8`（既定: `8`）
 - `--parity N|E|O|M|S`（既定: `N`）
@@ -118,14 +118,14 @@ python seria.py COM3 COM5 /dev/rfcomm0
 - `--xonxoff`（XON/XOFF 有効）
 - `--dsrdtr`（DSR/DTR 有効）
 
-## 5.5 デコード
+### 5.5 デコード
 
 - `--encodings utf-8,cp932,ascii`
   - 受信 payload を順にデコード試行
   - 既定: `utf-8,shift_jis`
   - すべて失敗時は `binary` 扱い
 
-## 5.6 出力
+### 5.6 出力
 
 - `--json`
   - 結果 JSON を標準出力へ出力（stdout は JSON のみ）
@@ -138,6 +138,16 @@ python seria.py COM3 COM5 /dev/rfcomm0
   - `--json` / `--json-file` と組み合わせると、監視バッチ向けの静かな実行が可能
 - `--no-attr`
   - ポート属性（VID:PID、メーカー等）の表示省略
+
+
+### 5.7 コンソール表示言語
+
+- 既定は日本語表示です。
+- ただし **Linux ローカルのプレーンコンソール（`TERM=linux`）** では英語表示に自動切り替えされます。
+  - SSH 接続先ターミナル、X Window 上のターミナル、Windows/macOS は日本語表示のままです。
+- 環境変数 `SERIA_FORCE_LANG` で強制指定できます。
+  - `SERIA_FORCE_LANG=en` または `SERIA_FORCE_LANG=english` : 英語表示
+  - `SERIA_FORCE_LANG=ja` または `SERIA_FORCE_LANG=jp` : 日本語表示
 
 ---
 
