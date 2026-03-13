@@ -133,7 +133,9 @@ python seria.py COM3 COM5 /dev/rfcomm0
 - `--json-file <path>`
   - 結果 JSON をファイル保存
 - `--quiet`
-  - 通常出力を抑制（エラーのみ標準エラーに表示）
+  - 通常出力（active/silent の結果表示）を抑制
+  - シリアルエラーが発生した組み合わせだけを標準エラーに表示
+  - `--json` / `--json-file` と組み合わせると、監視バッチ向けの静かな実行が可能
 - `--no-attr`
   - ポート属性（VID:PID、メーカー等）の表示省略
 
@@ -203,12 +205,22 @@ python seria.py COM3 --quiet --json-file incident.json
   - encodings
   - 指定ポート / baudrates / wait / timeout / serial設定 など
 - `results[]`
-  - `port`, `baudrate`, `status(active|silent|error)`
+  - `port`, `baudrate`
+  - `has_data`（1件以上チャンク受信したか）
+  - `has_error`（オープン/読み取り/クローズ時に例外があったか）
+  - `error`（エラー文字列。エラーなしは `null`）
   - `port_info`
   - `serial_params`
-  - `chunks[]`（repr/hex/bytes/decoded など）
+  - `chunk_count`
+  - `chunks[]`（`repr`/`hex`/`raw_bytes`/`payload_bytes`/`delim_bytes`/`terminator`/`encoding`/`decoded`/`char_count`/`bytes_per_char`/`frame_complete`/`reason`）
 
 障害解析ログとして、後で実行条件を再現しやすい形を目指しています。
+
+補足:
+- `has_data` と `has_error` は直交するフラグです。
+  例: 受信自体は成功したが `close()` でエラーになった場合、`has_data=true` かつ `has_error=true` になり得ます。
+- newline モードでは CR が末尾で分割到着した場合に CRLF 判定を優先するため、期限付き待機中は次バイトを待ちます。
+  ただし `deadline` が無い呼び出しでは無限待機しないよう、空読み時は pending を返す安全動作になっています。
 
 ---
 
