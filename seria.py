@@ -292,14 +292,14 @@ class SerialParams:
 
 @dataclass(frozen=True)
 class AppConfig:
-    requested_ports: List[str]
-    baudrates: List[int]
+    requested_ports: Tuple[str, ...]
+    baudrates: Tuple[int, ...]
     read_mode: ReadMode
     lines: int
     wait_sec: int
     timeout_sec: float
     serial_config: SerialConfig
-    encodings: List[str]
+    encodings: Tuple[str, ...]
     json_stdout: bool
     json_file: Optional[str]
     quiet: bool
@@ -307,11 +307,13 @@ class AppConfig:
     lang: Language
 
 
-@dataclass(frozen=True)
 class ConfigError(Exception):
     """CLI 設定解決中に発生した利用者向けエラー。"""
-    ja: str
-    en: str
+
+    def __init__(self, ja: str, en: str) -> None:
+        self.ja = ja
+        self.en = en
+        super().__init__(ja)
 
 
 @dataclass
@@ -509,10 +511,13 @@ def looks_like_text(decoded: str) -> bool:
             control_count += 1
 
     total = len(decoded)
+    # printable_count + control_count が total 未満になる文字（例: surrogate）がありうる。
+    # それらは「非テキスト寄り」とみなすため、分母は total のままにして厳しめに判定する。
     printable_ratio = printable_count / total
     control_ratio = control_count / total
     # 可視文字 95% 以上かつ制御文字 5% 以下をテキストとみなす経験則。
     return printable_ratio >= 0.95 and control_ratio <= 0.05
+
 
 def parse_baudrates(raw: str) -> List[int]:
     """--baudrate の入力文字列を整数リストに変換する。"""
@@ -886,52 +891,46 @@ def monitor_port(
     lang: Language = 'ja',
 ) -> None:
     """スレッド内で 1 ポートを監視し、結果を result に格納する"""
-    try:
-        ser = serial.Serial(
-            port,
-            baudrate,
-            timeout         = timeout,
-            bytesize        = serial_cfg.bytesize,
-            parity          = serial_cfg.parity,
-            stopbits        = serial_cfg.stopbits,
-            rtscts          = serial_cfg.rtscts,
-            xonxoff         = serial_cfg.xonxoff,
-            dsrdtr          = serial_cfg.dsrdtr,
-        )
-    except serial.SerialException as e:
-        result.error = str(e)
-        return
-
     collected: List[ChunkRecord] = []
     line_reader = LineBufferedReader()
     deadline = time.monotonic() + wait_sec
     try:
-        while time.monotonic() < deadline:
-            try:
-                chunk = read_one_chunk(ser, read_mode, line_reader=line_reader, deadline=deadline)
-            except ReferenceError as e:
-                # pyserial の内部オブジェクトが GC された場合など、
-                # まれに weakref 由来の ReferenceError が伝播することがある。
-                result.error = f"ReferenceError while reading serial port: {e}"
-                break
-            except (serial.SerialException, OSError) as e:
-                result.error = f"I/O error while reading serial port: {e}"
-                break
-            if chunk:
-                frame_complete, reason = classify_chunk(chunk, read_mode)
-                collected.append(ChunkRecord(data=chunk, frame_complete=frame_complete, reason=reason))
-                if not quiet:
-                    with log_lock:
-                        print(tr(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", f"  [{port}@{baudrate}] chunk {len(collected)}: {repr(chunk)}", lang=lang), file=sys.stderr)
-                if len(collected) >= num_chunks:
+        with serial.Serial(
+            port,
+            baudrate,
+            timeout=timeout,
+            bytesize=serial_cfg.bytesize,
+            parity=serial_cfg.parity,
+            stopbits=serial_cfg.stopbits,
+            rtscts=serial_cfg.rtscts,
+            xonxoff=serial_cfg.xonxoff,
+            dsrdtr=serial_cfg.dsrdtr,
+        ) as ser:
+            while time.monotonic() < deadline:
+                try:
+                    chunk = read_one_chunk(ser, read_mode, line_reader=line_reader, deadline=deadline)
+                except ReferenceError as e:
+                    # pyserial の内部オブジェクトが GC された場合など、
+                    # まれに weakref 由来の ReferenceError が伝播することがある。
+                    result.error = f"ReferenceError while reading serial port: {e}"
                     break
-    finally:
-        try:
-            ser.close()
-        except (ReferenceError, serial.SerialException, OSError) as e:
-            # クローズ時に weakref 由来エラーが発生しても、取得済みデータは保持する。
-            if not result.error:
-                result.error = f"{type(e).__name__} while closing serial port: {e}"
+                except (serial.SerialException, OSError) as e:
+                    result.error = f"I/O error while reading serial port: {e}"
+                    break
+                if chunk:
+                    frame_complete, reason = classify_chunk(chunk, read_mode)
+                    collected.append(ChunkRecord(data=chunk, frame_complete=frame_complete, reason=reason))
+                    if not quiet:
+                        with log_lock:
+                            print(tr(f"  [{port}@{baudrate}] チャンク {len(collected)}: {repr(chunk)}", f"  [{port}@{baudrate}] chunk {len(collected)}: {repr(chunk)}", lang=lang), file=sys.stderr)
+                    if len(collected) >= num_chunks:
+                        break
+    except serial.SerialException as e:
+        result.error = str(e)
+    except (ReferenceError, OSError) as e:
+        # クローズ時に weakref 由来エラーが発生しても、取得済みデータは保持する。
+        if not result.error:
+            result.error = f"{type(e).__name__} while closing serial port: {e}"
 
     result.chunks = collected
 
@@ -1064,109 +1063,116 @@ def print_results(
     quiet: bool = False,
     lang: Language = 'ja',
 ) -> None:
-    """
-    人間可読な形式でサマリーを表示する。
-    no_attr=True のときはポート属性（VID:PID・メーカー等）を省略する。
-    quiet=True のときは通常結果を抑制し、シリアルエラーのみを表示する。
-    """
+    """人間可読な形式でサマリーを表示する。"""
     active = [r for r in results if r.has_data]
     silent = [r for r in results if not r.has_data and not r.has_error]
     errors = [r for r in results if r.has_error]
 
     if quiet:
         if errors:
-            print(msg_serial_errors(lang), file=sys.stderr)
-            for r in errors:
-                print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
+            print_error_list(errors, lang=lang)
         return
 
     print("\n" + "=" * 56, file=sys.stderr)
     print(tr("  監視結果サマリー", "  Monitoring summary", lang=lang), file=sys.stderr)
     print("=" * 56, file=sys.stderr)
 
-    for r in active:
-        print(tr(f"\n  ポート    : {r.port}  @  {r.baudrate} bps", f"\n  Port      : {r.port}  @  {r.baudrate} bps", lang=lang), file=sys.stderr)
-        params = r.serial_params
-        serial_ja = (
-            f"  シリアル  : {params.bytesize}{params.parity}{params.stopbits}"
-            f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
-            f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
-            f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
-        )
-        serial_en = (
-            f"  Serial    : {params.bytesize}{params.parity}{params.stopbits}"
-            f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
-            f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
-            f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
-        )
-        print(tr(serial_ja, serial_en, lang=lang), file=sys.stderr)
-        if not no_attr:
-            print_port_info(r.port_info, stream=sys.stderr, lang=lang)
-        print(tr(f"  受信チャンク数: {len(r.chunks)}", f"  Received chunks: {len(r.chunks)}", lang=lang), file=sys.stderr)
-        print(f"  {'-'*50}", file=sys.stderr)
-
-        for i, chunk_item in enumerate(r.chunks, start=1):
-            stats = r.chunk_stats_list[i - 1]
-            data = chunk_item.data
-            print(tr(f"  --- チャンク {i} ---", f"  --- Chunk {i} ---", lang=lang), file=sys.stderr)
-            print(f"    repr         : {repr(data)}", file=sys.stderr)
-            print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
-            print(tr(f"    終端         : {stats.terminator}", f"    Terminator   : {stats.terminator}", lang=lang), file=sys.stderr)
-            frame_complete_label = tr('はい' if chunk_item.frame_complete else 'いいえ', 'Yes' if chunk_item.frame_complete else 'No', lang=lang)
-            reason_label = frame_reason_label(chunk_item.reason, lang=lang)
-            print(tr(
-                f"    完全フレーム : {frame_complete_label}  ({reason_label})",
-                f"    Full frame   : {frame_complete_label}  ({reason_label})",
-                lang=lang
-            ), file=sys.stderr)
-            print(tr(
-                f"    受信バイト数 : {stats.raw_bytes} bytes  （データ {stats.payload_bytes} + 終端 {stats.delim_bytes}）",
-                f"    Received     : {stats.raw_bytes} bytes  (payload {stats.payload_bytes} + terminator {stats.delim_bytes})",
-                lang=lang
-            ), file=sys.stderr)
-            if stats.encoding == 'binary':
-                print(tr("    デコード     : 失敗（バイナリデータ）", "    Decode       : failed (binary data)", lang=lang), file=sys.stderr)
-            else:
-                print(f"    {stats.encoding.upper():9}    : {stats.decoded}", file=sys.stderr)
-                bpc_display = f"{stats.bytes_per_char:.2f}" if stats.bytes_per_char is not None else "-"
-                print(tr(
-                    f"    文字数       : {stats.char_count} 文字  （平均 {bpc_display} bytes/char）",
-                    f"    Characters   : {stats.char_count}  (avg {bpc_display} bytes/char)",
-                    lang=lang
-                ), file=sys.stderr)
-
-        # 複数チャンクの統計
-        if len(r.chunks) > 1:
-            chunk_stats_list = r.chunk_stats_list
-            payloads = [s.payload_bytes for s in chunk_stats_list]
-            chars    = [s.char_count for s in chunk_stats_list if s.char_count is not None]
-            print(tr(f"\n  --- 統計サマリー ({len(r.chunks)} チャンク) ---", f"\n  --- Statistics ({len(r.chunks)} chunks) ---", lang=lang), file=sys.stderr)
-            print(tr(
-                f"    データバイト数: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
-                f"    Payload bytes: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
-                lang=lang
-            ), file=sys.stderr)
-            if chars:
-                print(tr(
-                    f"    文字数        : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
-                    f"    Characters   : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
-                    lang=lang
-                ), file=sys.stderr)
+    for result in active:
+        print_active_result(result, no_attr=no_attr, lang=lang)
 
     if silent:
-        print(tr("\n【データなし（タイムアウト）】", "\n[No data (timeout)]", lang=lang), file=sys.stderr)
-        for r in silent:
-            print(f"  {r.port} @ {r.baudrate} bps", end='', file=sys.stderr)
-            if not no_attr and r.port_info.description:
-                print(f"  ({r.port_info.description})", end='', file=sys.stderr)
-            print(file=sys.stderr)
+        print_silent_list(silent, lang=lang)
 
     if errors:
-        print(msg_serial_errors(lang), file=sys.stderr)
-        for r in errors:
-            print(f"  {r.port} @ {r.baudrate} bps : {r.error}", file=sys.stderr)
+        print_error_list(errors, lang=lang)
 
-    print("=" * 56, file=sys.stderr)
+
+def print_active_result(result: PortResult, no_attr: bool, lang: Language) -> None:
+    print(tr(f"\n  ポート    : {result.port}  @  {result.baudrate} bps", f"\n  Port      : {result.port}  @  {result.baudrate} bps", lang=lang), file=sys.stderr)
+    params = result.serial_params
+    serial_ja = (
+        f"  シリアル  : {params.bytesize}{params.parity}{params.stopbits}"
+        f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
+        f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
+        f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
+    )
+    serial_en = (
+        f"  Serial    : {params.bytesize}{params.parity}{params.stopbits}"
+        f"  RTS/CTS={'ON' if params.rtscts else 'OFF'}"
+        f"  XON/XOFF={'ON' if params.xonxoff else 'OFF'}"
+        f"  DSR/DTR={'ON' if params.dsrdtr else 'OFF'}"
+    )
+    print(tr(serial_ja, serial_en, lang=lang), file=sys.stderr)
+    if not no_attr:
+        print_port_info(result.port_info, stream=sys.stderr, lang=lang)
+    print(tr(f"  受信チャンク数: {len(result.chunks)}", f"  Received chunks: {len(result.chunks)}", lang=lang), file=sys.stderr)
+    print(f"  {'-' * 50}", file=sys.stderr)
+
+    for i, chunk_item in enumerate(result.chunks, start=1):
+        print_chunk_result(i, chunk_item, result.chunk_stats_list[i - 1], lang=lang)
+
+    if len(result.chunks) > 1:
+        print_chunk_statistics(result, lang=lang)
+
+
+def print_chunk_result(index: int, chunk_item: ChunkRecord, stats: ChunkStats, lang: Language) -> None:
+    data = chunk_item.data
+    print(tr(f"  --- チャンク {index} ---", f"  --- Chunk {index} ---", lang=lang), file=sys.stderr)
+    print(f"    repr         : {repr(data)}", file=sys.stderr)
+    print(f"    hex          : {data.hex(' ')}", file=sys.stderr)
+    print(tr(f"    終端         : {stats.terminator}", f"    Terminator   : {stats.terminator}", lang=lang), file=sys.stderr)
+    frame_complete_label = tr('はい' if chunk_item.frame_complete else 'いいえ', 'Yes' if chunk_item.frame_complete else 'No', lang=lang)
+    reason_label = frame_reason_label(chunk_item.reason, lang=lang)
+    print(tr(
+        f"    完全フレーム : {frame_complete_label}  ({reason_label})",
+        f"    Full frame   : {frame_complete_label}  ({reason_label})",
+        lang=lang
+    ), file=sys.stderr)
+    print(tr(
+        f"    受信バイト数 : {stats.raw_bytes} bytes  （データ {stats.payload_bytes} + 終端 {stats.delim_bytes}）",
+        f"    Received     : {stats.raw_bytes} bytes  (payload {stats.payload_bytes} + terminator {stats.delim_bytes})",
+        lang=lang
+    ), file=sys.stderr)
+    if stats.encoding == 'binary':
+        print(tr("    デコード     : 失敗（バイナリデータ）", "    Decode       : failed (binary data)", lang=lang), file=sys.stderr)
+        return
+
+    print(f"    {stats.encoding.upper():9}    : {stats.decoded}", file=sys.stderr)
+    bpc_display = f"{stats.bytes_per_char:.2f}" if stats.bytes_per_char is not None else "-"
+    print(tr(
+        f"    文字数       : {stats.char_count} 文字  （平均 {bpc_display} bytes/char）",
+        f"    Characters   : {stats.char_count}  (avg {bpc_display} bytes/char)",
+        lang=lang
+    ), file=sys.stderr)
+
+
+def print_chunk_statistics(result: PortResult, lang: Language) -> None:
+    payloads = [s.payload_bytes for s in result.chunk_stats_list]
+    chars = [s.char_count for s in result.chunk_stats_list if s.char_count is not None]
+    print(tr(f"\n  --- 統計サマリー ({len(result.chunks)} チャンク) ---", f"\n  --- Statistics ({len(result.chunks)} chunks) ---", lang=lang), file=sys.stderr)
+    print(tr(
+        f"    データバイト数: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
+        f"    Payload bytes: min={min(payloads)}  max={max(payloads)}  avg={sum(payloads)/len(payloads):.1f}",
+        lang=lang
+    ), file=sys.stderr)
+    if chars:
+        print(tr(
+            f"    文字数       : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
+            f"    Characters   : min={min(chars)}  max={max(chars)}  avg={sum(chars)/len(chars):.1f}",
+            lang=lang
+        ), file=sys.stderr)
+
+
+def print_silent_list(results: Sequence[PortResult], lang: Language) -> None:
+    print(tr("\n【受信なし（タイムアウト）】", "\n[No data received (timeout)]", lang=lang), file=sys.stderr)
+    for result in results:
+        print(f"  {result.port} @ {result.baudrate} bps", file=sys.stderr)
+
+
+def print_error_list(results: Sequence[PortResult], lang: Language) -> None:
+    print(msg_serial_errors(lang), file=sys.stderr)
+    for result in results:
+        print(f"  {result.port} @ {result.baudrate} bps : {result.error}", file=sys.stderr)
 
 
 # ==============================
@@ -1252,14 +1258,14 @@ def build_app_config(args: argparse.Namespace, lang: Language) -> AppConfig:
         ) from exc
 
     return AppConfig(
-        requested_ports=list(args.port),
-        baudrates=baudrates,
+        requested_ports=tuple(args.port),
+        baudrates=tuple(baudrates),
         read_mode=read_mode,
         lines=args.lines,
         wait_sec=args.wait,
         timeout_sec=args.timeout,
         serial_config=serial_cfg,
-        encodings=encodings,
+        encodings=tuple(encodings),
         json_stdout=args.json,
         json_file=args.json_file,
         quiet=args.quiet,
