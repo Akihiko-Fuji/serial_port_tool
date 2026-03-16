@@ -23,7 +23,7 @@ pip install pyserial
 python seria.py --help
 python seria.py
 python seria.py COM3 -b 9600,115200 --newline -n 3
-
+```
 
 ## 1. 主な用途
 
