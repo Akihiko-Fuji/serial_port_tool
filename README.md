@@ -1,9 +1,14 @@
 # serial_port_tool（`seria.py`）
+> **A practical CLI tool for serial
+> communication troubleshooting.**  
+> Probe multiple ports and baud rates, detect line endings or custom delimiters, inspect text/binary payloads, and save reproducible logs as JSON.  
+> Supports Linux, macOS, and Windows.
 
-`seria.py` は、**シリアル通信の障害切り分け・現地調査向け**に作られた確認スクリプトです。  
-「どのポートで」「どのボーレートで」「どんな終端（デリミタ）で」「何バイト/何文字のデータが来ているか」を、
-**複数ポート × 複数ボーレートで同時に**確認できます。
-1ファイルにまとめていますので、利用環境にファイルを置けば、すぐに使えるようなデザインとなっています。
+---
+
+`seria.py` は、シリアル通信の障害切り分け・現地調査向けに作られた確認スクリプトです。  
+「どのポートで」「どのボーレートで」「どんな終端（デリミタ）で」「何バイト/何文字のデータが来ているか」を、複数ポート × 複数ボーレートで同時に確認できます。  
+1ファイルにまとめているため、利用環境にファイルを置けばすぐに使える設計です。
 
 > **設計方針（トレードオフ）**  
 > 本ツールは **現地調査での見逃しを避けることを最優先**にしています（反応性・確実性 > 省資源）。  
@@ -11,6 +16,14 @@
 > また `--wait` は「概ねの最大待機時間」を与えるもので、実際の終了時刻は `--timeout` の設定や読み取り境界の都合でわずかに超過することがあります。
 
 ---
+## Quick Start
+
+```bash
+pip install pyserial
+python seria.py --help
+python seria.py
+python seria.py COM3 -b 9600,115200 --newline -n 3
+
 
 ## 1. 主な用途
 
