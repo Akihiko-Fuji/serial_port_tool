@@ -196,7 +196,7 @@ python seria.py --delimiter 0D0A -n 5 --json-file result.json
 python seria.py /dev/ttyUSB0 --chunk 16 --bytesize 7 --parity E --stopbits 1 --rtscts
 ```
 
-### 6.5 調査ログ用途（静かに実行）
+### 6.5 調査ログ用途
 
 ```bash
 python seria.py COM3 --quiet --json-file incident.json
@@ -206,7 +206,7 @@ python seria.py COM3 --quiet --json-file incident.json
 
 ## 7. 出力の見方
 
-### 7.1 コンソール出力（人間可読）
+### 7.1 コンソール出力
 
 アクティブな組み合わせ（データ受信あり）ごとに、以下を表示します。
 
